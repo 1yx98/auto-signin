@@ -250,21 +250,7 @@ def _local_ip():
         return "0.0.0.0"
 
 
-# ── 3. 检测是否需要 Portal 认证 ───────────────────────
-def need_auth():
-    """检测是否需要网页认证。"""
-    for url in (PROBE_URLS[0], PROBE_URLS[1], GATEWAY):
-        status, final_url, text = _request(url, timeout=5)
-        if "10.123.0.253" in (final_url or ""):
-            return True
-        if any(m in (text or "") for m in DRCOM_MARKERS):
-            return True
-        if status in (200, 204) and final_url != url:
-            return True
-    return not has_internet()
-
-
-# ── 4. HTTP 认证（Dr.COM） ────────────────────────────
+# ── 3. HTTP 认证（Dr.COM） ────────────────────────────
 def _make_opener():
     import http.cookiejar
     jar = http.cookiejar.CookieJar()
@@ -458,7 +444,7 @@ def try_http_auth(username, password):
     return has_internet(fast=True)
 
 
-# ── 5. 兜底：用真实浏览器自动填表登录 ─────────────
+# ── 4. 兜底：用真实浏览器自动填表登录 ─────────────
 def open_browser_auth(username=None, password=None):
     """HTTP 接口打不通时的兜底：起一个真浏览器打开校园网登录页，
     自动把账号密码填进去、勾上"已阅读"、点"登 录"。

@@ -790,21 +790,6 @@ def paste_text(text):
     pyautogui.press("delete"); time.sleep(0.1)
     pyautogui.hotkey("ctrl", "v"); time.sleep(0.2)
 
-def region_color(cx, cy, w=120, h=36):
-    s = screen_bgr(); H, W = s.shape[:2]
-    x1 = max(0, cx - w // 2); y1 = max(0, cy - h // 2)
-    x2 = min(W, cx + w // 2); y2 = min(H, cy + h // 2)
-    reg = s[y1:y2, x1:x2]
-    return float(reg[:, :, 2].mean()), float(reg[:, :, 1].mean()), float(reg[:, :, 0].mean())  # R,G,B
-
-def is_blue(c):
-    r, g, b = c
-    return b > r + 25 and b > 110
-
-def is_gray(c):
-    r, g, b = c
-    return abs(r - g) < 18 and abs(g - b) < 18 and 80 < r < 200
-
 # ==================== 主流程各步 ====================
 def minimize_wechat_main():
     """小程序打开后，把标题恰为'微信'的主窗最小化，避免遮挡小程序右侧（不影响'油学通'独立窗）"""
