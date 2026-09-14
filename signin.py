@@ -860,6 +860,51 @@ def close_update_popup(tries=5):
     logger.warning("[更新弹窗] 多次尝试后弹窗可能仍在，继续后续流程")
     return True
 
+def _unmaximize_wechat(hwnd, tag=""):
+    """把最大化的微信窗口恢复成普通尺寸。返回 True=当前已是普通尺寸。
+
+    【为什么必须做】微信 4.x 最大化后聊天列表列变宽，**顶部搜索框会被拉成另一个长宽比**
+    （实测模板 345x36 → 最大化下约 280x44）。而多尺度匹配是**等比缩放**的，改不了长宽比，
+    所以 0.5~2.5 倍全部只能到 ~0.59，阈值 0.62 永远够不到 → 搜索必然失败
+    （2026-09-14 20:55 定时任务、21:22 手动测试都是这么挂的）。
+
+    而且微信会**记住**最大化状态，杀进程重启也会还原成最大化（实测 21:23），
+    所以"重启微信"救不了这个问题，**必须主动取消最大化**。
+
+    取消顺序按"最接近人工操作"排，每步都用 IsZoomed 复核：
+      1) ShowWindow(SW_RESTORE) —— 纯窗口 API，不依赖输入注入
+      2) WM_SYSCOMMAND + SC_RESTORE
+      3) Win+↓ —— Windows 标准快捷键，Qt 窗口认这个
+    """
+    try:
+        if not user32.IsZoomed(hwnd):
+            return True
+    except Exception:
+        return True
+    logger.warning(f"[窗口] {tag}检测到微信窗口处于最大化——最大化会改变搜索框长宽比导致匹配失败，"
+                   f"正在取消最大化")
+    for how, fn in (
+        ("SW_RESTORE", lambda: user32.ShowWindow(hwnd, 9)),
+        ("SC_RESTORE", lambda: user32.PostMessageW(hwnd, 0x0112, 0xF120, 0)),
+        ("Win+↓",      lambda: (activate("微信", exact=True, logs=False),
+                                time.sleep(0.4), pyautogui.hotkey("win", "down"))),
+    ):
+        try:
+            fn()
+        except Exception as e:
+            logger.warning(f"[窗口] 取消最大化({how})异常: {e}")
+        time.sleep(1.2)
+        try:
+            if not user32.IsZoomed(hwnd):
+                l, t, r, b = win_rect(hwnd)
+                logger.info(f"[窗口] {tag}已取消最大化（{how}）→ {r-l}x{b-t}")
+                return True
+        except Exception:
+            return False
+    logger.warning(f"[窗口] {tag}三种方式都没能取消最大化，搜索可能失败")
+    return False
+
+
 def step_enter_wechat(allow_restart=True):
     """若停在'进入微信'确认页则点进去；等待主界面真正渲染（非白屏）；再关闭'更新说明'弹窗。"""
     hw0 = activate("微信", exact=True)
@@ -895,7 +940,11 @@ def step_enter_wechat(allow_restart=True):
     h = wait_wechat_rendered(timeout=8, tag="关闭弹窗后")
     if not h and allow_restart:
         return restart_wechat_and_enter()
-    activate("微信", exact=True)
+    h = activate("微信", exact=True)
+    # 取消最大化：最大化会让顶部搜索框变成另一个长宽比，等比多尺度匹配永远够不到阈值
+    # （详见 _unmaximize_wechat 的注释）。放在这里是为了让后续整个流程都在普通窗口下跑。
+    if h:
+        _unmaximize_wechat(h, tag="进入主界面后")
     shot("微信主界面就绪")
     return True
 
@@ -1077,11 +1126,14 @@ def _ensure_search_box_matchable():
     关键认知：脚本是拿**屏幕截图**做匹配的，看的是"屏幕上这块像素长什么样"，
     不是"窗口内部长什么样"。所以任何盖在微信上的东西都会让它失效。
 
-    抢救顺序（从轻到重，都是实测有效的手段）：
+    抢救顺序（从轻到重，都有实测依据）：
       1) 清遮挡：最小化所有与微信有实质重叠的可见窗口（排除系统窗口）——
-         解决"被悬浮歌词/弹窗/别的窗口盖住"，这是最常见的原因；
-      2) 重启微信：解决"窗口尺寸/渲染状态异常"（Qt 窗口最大化后外部改不回去，
-         只能靠重启恢复，实测重启后 conf 回到 0.72~0.80）。
+         解决"被悬浮歌词/弹窗/别的窗口盖住"。2026-09-14 21:25 实测有效：
+         清掉 2 个遮挡窗口后，搜索框 conf 从 0.53x 回到 0.782；
+      2) 取消最大化：微信最大化后聊天列表列变宽，搜索框被拉成另一个长宽比，
+         等比多尺度匹配永远够不到阈值（实测 0.5~2.5 倍最高只有 0.589）。
+         必须主动取消——**重启微信救不了**，因为微信会记住最大化状态；
+      3) 重启微信：兜底（窗口尺寸/渲染真的异常时）。
 
     返回 True=可匹配（或抢救后已恢复）；False=仍不行（多半要重采模板）。
     """
@@ -1113,7 +1165,19 @@ def _ensure_search_box_matchable():
     else:
         logger.warning("[搜索] 没有找到盖在微信上的窗口")
 
-    # ---- 第 2 步：重启微信（窗口尺寸/渲染异常时的唯一恢复手段）----
+    # ---- 第 2 步：取消最大化（最大化会改变搜索框长宽比，等比多尺度匹配够不到阈值）----
+    if hwnd and user32.IsZoomed(hwnd):
+        if _unmaximize_wechat(hwnd, tag="体检失败后"):
+            time.sleep(0.8)
+            hwnd2 = activate("微信", exact=True, logs=False) or hwnd
+            c = _search_box_conf(hwnd2)
+            if c >= 0.62:
+                logger.info(f"[搜索] 取消最大化后搜索框可匹配 (conf={c:.3f})，继续搜索")
+                return True
+            logger.warning(f"[搜索] 取消最大化后仍只有 conf={c:.3f}")
+        hwnd = activate("微信", exact=True, logs=False) or hwnd
+
+    # ---- 第 3 步：重启微信（窗口尺寸/渲染异常时的兜底手段）----
     logger.warning(f"[搜索] 重启微信以恢复窗口状态（当前 conf={c:.3f}）")
     try:
         shot("搜索框体检失败_重启微信前")
