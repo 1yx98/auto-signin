@@ -53,6 +53,18 @@
 
 ## 四、配置（config.json）
 
+> **⚠️ 首次使用先复制示例配置**：仓库里**不含** `config.json` 和
+> `notify_helper/notify_config.json`（里面有你的账号密码和飞书密钥，已被 `.gitignore` 排除）。
+> 克隆后先把示例复制成真配置再改：
+>
+> ```
+> copy config.example.json config.json
+> copy notify_helper\notify_config.example.json notify_helper\notify_config.json
+> ```
+>
+> 然后把 `config.json` 的 `wifi_username` / `wifi_password` 填成你的校园网账号密码。
+> **改完不要提交这两个文件。**
+
 | 字段 | 说明 |
 |---|---|
 | `search_keyword` | 搜索关键词，默认 `油学通` |
