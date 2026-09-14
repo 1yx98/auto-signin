@@ -94,9 +94,18 @@ SIGNIN_TIME_END = CONFIG.get("signin_time_end", "21:30")      # 签到结束时�
 
 def before_signin_start():
     """当前时间是否在签到开放时间之前。
-    用于防止：签到时段前列表/详情页显示的是昨天的'已签到'记录，被误判为今天已签。"""
+    用于防止：签到时段前列表/详情页显示的是昨天的'已签到'记录，被误判为今天已签。
+
+    config 里 signin_time_start 写坏时（不是 HH:MM）**保守返回 True**：
+    宁可多走一遍详情页/判成"未开始"，也不要静默把昨天的记录当今天已签。
+    原来直接 `map(int, ...)`，配置写错会抛异常把整轮打挂。"""
+    try:
+        h, m = map(int, str(SIGNIN_TIME_START).strip().split(":"))
+    except Exception as e:
+        logger.warning(f"[前置] config.signin_time_start='{SIGNIN_TIME_START}' 解析失败（应为 HH:MM）: {e}"
+                       f"，按'签到未开始'保守处理")
+        return True
     now = datetime.now()
-    h, m = map(int, SIGNIN_TIME_START.split(":"))
     return (now.hour, now.minute) < (h, m)
 LOG_DIR = abs_path(CONFIG["log_dir"])
 CONFIDENCE = CONFIG.get("confidence", 0.8)
@@ -139,6 +148,33 @@ def _prune_old_runs():
     except Exception:
         pass
 _prune_old_runs()
+
+
+def _prune_old_logs():
+    """清理过期的「按天汇总日志」signin_YYYYMMDD.log。
+
+    原来只清理 run_* 目录，按天日志从来不删、会一直长下去（每天约 40KB）。
+    这里按 KEEP_DAYS 删旧日期，**今天的绝不动**（正被日志句柄占用，删也删不掉）。
+    注意：`logs/task_run.log` 是 .bat 用 `>>` 重定向写的、脚本运行时一直被占用，
+    既删不掉也轮转不了；它约 30KB/天、一年约 11MB，暂不处理。
+    """
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+        cutoff = datetime.now() - timedelta(days=KEEP_DAYS)
+        for n in os.listdir(LOG_DIR):
+            if not (n.startswith("signin_") and n.endswith(".log")):
+                continue
+            d = n[len("signin_"):-len(".log")]
+            if d == today or len(d) != 8 or not d.isdigit():
+                continue
+            try:
+                if datetime.strptime(d, "%Y%m%d") < cutoff:
+                    os.remove(os.path.join(LOG_DIR, n))
+            except Exception:
+                pass
+    except Exception:
+        pass
+_prune_old_logs()
 
 # 步骤轨迹追踪器（纯观察，零副作用）：每次运行写 step_trace.json，机器可读失败定位
 TRACE = step_tracer.StepTracer(RUN_ID, RUN_DIR)
@@ -1990,7 +2026,12 @@ def shutdown_pc():
         logger.info("[关机] 配置为不关机，跳过")
         return
     logger.info(f"[关机] 签到成功，{SHUTDOWN_DELAY} 秒后关机；如需取消执行 shutdown /a")
-    subprocess.run(["shutdown", "/s", "/t", str(SHUTDOWN_DELAY), "/c", "油学通签到完成，即将关机"])
+    try:
+        # 给 timeout：shutdown 正常立即返回，但万一卡住不能让它拖着脚本不放
+        subprocess.run(["shutdown", "/s", "/t", str(SHUTDOWN_DELAY), "/c", "油学通签到完成，即将关机"],
+                       capture_output=True, timeout=15)
+    except Exception as e:
+        logger.warning(f"[关机] 调用 shutdown 失败(忽略，请手动关机): {e}")
 
 # ==================== 主流程 ====================
 def _cls(h):
