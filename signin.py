@@ -860,48 +860,85 @@ def close_update_popup(tries=5):
     logger.warning("[更新弹窗] 多次尝试后弹窗可能仍在，继续后续流程")
     return True
 
-def _unmaximize_wechat(hwnd, tag=""):
-    """把最大化的微信窗口恢复成普通尺寸。返回 True=当前已是普通尺寸。
+# 微信窗口宽度超过这个值，顶部搜索框就会被拉长到模板匹配不上。
+# 实测能匹配的宽度：863 / 1118；匹配不上的：2906（手拖大或最大化）。
+_WECHAT_MAX_OK_WIDTH = 1400
+# 实测能正常匹配的普通尺寸（脚本自己启动微信时就是这个量级）
+_WECHAT_NORMAL_SIZE = (1118, 1715)
 
-    【为什么必须做】微信 4.x 最大化后聊天列表列变宽，**顶部搜索框会被拉成另一个长宽比**
-    （实测模板 345x36 → 最大化下约 280x44）。而多尺度匹配是**等比缩放**的，改不了长宽比，
-    所以 0.5~2.5 倍全部只能到 ~0.59，阈值 0.62 永远够不到 → 搜索必然失败
-    （2026-09-14 20:55 定时任务、21:22 手动测试都是这么挂的）。
 
-    而且微信会**记住**最大化状态，杀进程重启也会还原成最大化（实测 21:23），
-    所以"重启微信"救不了这个问题，**必须主动取消最大化**。
+def _normalize_wechat_size(hwnd, tag=""):
+    """把微信窗口恢复成"搜索框模板能匹配"的普通尺寸。返回 True=当前尺寸可用。
 
-    取消顺序按"最接近人工操作"排，每步都用 IsZoomed 复核：
-      1) ShowWindow(SW_RESTORE) —— 纯窗口 API，不依赖输入注入
-      2) WM_SYSCOMMAND + SC_RESTORE
-      3) Win+↓ —— Windows 标准快捷键，Qt 窗口认这个
+    【为什么必须做】微信 4.x 窗口一宽，聊天列表列跟着变宽，**顶部搜索框会被拉成另一个
+    长宽比**（模板 345x36 → 2906 宽窗口下约 280x44）。多尺度匹配是**等比缩放**的，
+    改不了长宽比，所以 0.5~2.5 倍全部只能到 ~0.59，阈值 0.62 永远够不到 → 搜索必然失败
+    （2026-09-14 20:55 定时任务、21:22 / 21:31 手动测试都是这么挂的）。
+
+    【两种"变宽"都要管】这是本函数踩过的坑：
+      · 点了最大化按钮 → `IsZoomed()==True` → 先取消最大化；
+      · **手动拖大的** → `IsZoomed()==False` 但宽度 2906（2026-09-14 21:31 实测就是这个）
+        → 只判断 IsZoomed 会漏掉，必须**按宽度**判断。
+    另外微信会记住窗口尺寸，杀进程重启也会还原，所以"重启微信"救不了这个问题。
     """
+    if not hwnd:
+        return True
     try:
-        if not user32.IsZoomed(hwnd):
-            return True
+        l, t, r, b = win_rect(hwnd)
     except Exception:
         return True
-    logger.warning(f"[窗口] {tag}检测到微信窗口处于最大化——最大化会改变搜索框长宽比导致匹配失败，"
-                   f"正在取消最大化")
-    for how, fn in (
-        ("SW_RESTORE", lambda: user32.ShowWindow(hwnd, 9)),
-        ("SC_RESTORE", lambda: user32.PostMessageW(hwnd, 0x0112, 0xF120, 0)),
-        ("Win+↓",      lambda: (activate("微信", exact=True, logs=False),
-                                time.sleep(0.4), pyautogui.hotkey("win", "down"))),
-    ):
-        try:
-            fn()
-        except Exception as e:
-            logger.warning(f"[窗口] 取消最大化({how})异常: {e}")
-        time.sleep(1.2)
-        try:
+    w, h = r - l, b - t
+
+    # 1) 如果确实处于"最大化"状态，先取消（顺序按"最接近人工操作"排，每步复核）
+    if user32.IsZoomed(hwnd):
+        logger.warning(f"[窗口] {tag}检测到微信窗口处于最大化——会改变搜索框长宽比导致匹配失败，"
+                       f"正在取消最大化")
+        for how, fn in (
+            ("SW_RESTORE", lambda: user32.ShowWindow(hwnd, 9)),
+            ("SC_RESTORE", lambda: user32.PostMessageW(hwnd, 0x0112, 0xF120, 0)),
+            ("Win+↓",      lambda: (activate("微信", exact=True, logs=False),
+                                    time.sleep(0.4), pyautogui.hotkey("win", "down"))),
+        ):
+            try:
+                fn()
+            except Exception as e:
+                logger.warning(f"[窗口] 取消最大化({how})异常: {e}")
+            time.sleep(1.2)
             if not user32.IsZoomed(hwnd):
-                l, t, r, b = win_rect(hwnd)
-                logger.info(f"[窗口] {tag}已取消最大化（{how}）→ {r-l}x{b-t}")
-                return True
+                logger.info(f"[窗口] {tag}已取消最大化（{how}）")
+                break
+        else:
+            logger.warning(f"[窗口] {tag}三种方式都没能取消最大化，改用直接设尺寸")
+        try:
+            l, t, r, b = win_rect(hwnd); w, h = r - l, b - t
         except Exception:
             return False
-    logger.warning(f"[窗口] {tag}三种方式都没能取消最大化，搜索可能失败")
+
+    # 2) 宽度仍然超标（手动拖大的，或取消最大化没成功）→ 直接 SetWindowPos 缩回普通尺寸
+    if w <= _WECHAT_MAX_OK_WIDTH:
+        return True
+    nw, nh = _WECHAT_NORMAL_SIZE
+    try:
+        sw, sh = pyautogui.size()
+        nx = max(0, min(l, sw - nw)); ny = max(0, min(t, sh - nh))
+    except Exception:
+        nx, ny = 0, 0
+    logger.warning(f"[窗口] {tag}窗口宽 {w}px 超出可用范围（>{_WECHAT_MAX_OK_WIDTH}）——"
+                   f"搜索框会被拉长到模板匹配不上，缩回 {nw}x{nh}")
+    try:
+        user32.SetWindowPos(hwnd, 0, nx, ny, nw, nh,
+                            0x0004 | 0x0010 | 0x0020)   # NOZORDER | NOACTIVATE | FRAMECHANGED
+    except Exception as e:
+        logger.warning(f"[窗口] SetWindowPos 缩回异常: {e}")
+    time.sleep(1.2)
+    try:
+        l, t, r, b = win_rect(hwnd)
+    except Exception:
+        return False
+    if (r - l) <= _WECHAT_MAX_OK_WIDTH:
+        logger.info(f"[窗口] {tag}已缩回 {r-l}x{b-t}")
+        return True
+    logger.warning(f"[窗口] {tag}缩回失败，当前仍为 {r-l}x{b-t}，搜索可能失败")
     return False
 
 
@@ -941,10 +978,11 @@ def step_enter_wechat(allow_restart=True):
     if not h and allow_restart:
         return restart_wechat_and_enter()
     h = activate("微信", exact=True)
-    # 取消最大化：最大化会让顶部搜索框变成另一个长宽比，等比多尺度匹配永远够不到阈值
-    # （详见 _unmaximize_wechat 的注释）。放在这里是为了让后续整个流程都在普通窗口下跑。
+    # 把窗口恢复成"搜索框模板能匹配"的普通尺寸：窗口一宽，搜索框就被拉成另一个长宽比，
+    # 等比多尺度匹配永远够不到阈值（详见 _normalize_wechat_size 注释）。
+    # 放在这里是为了让后续整个流程都在普通窗口下跑。
     if h:
-        _unmaximize_wechat(h, tag="进入主界面后")
+        _normalize_wechat_size(h, tag="进入主界面后")
     shot("微信主界面就绪")
     return True
 
@@ -1165,16 +1203,17 @@ def _ensure_search_box_matchable():
     else:
         logger.warning("[搜索] 没有找到盖在微信上的窗口")
 
-    # ---- 第 2 步：取消最大化（最大化会改变搜索框长宽比，等比多尺度匹配够不到阈值）----
-    if hwnd and user32.IsZoomed(hwnd):
-        if _unmaximize_wechat(hwnd, tag="体检失败后"):
+    # ---- 第 2 步：把窗口尺寸恢复成模板能匹配的普通尺寸 ----
+    # （不只看 IsZoomed：手动拖大的窗口 IsZoomed=False 但同样会让搜索框变形，见该函数注释）
+    if hwnd:
+        if _normalize_wechat_size(hwnd, tag="体检失败后"):
             time.sleep(0.8)
             hwnd2 = activate("微信", exact=True, logs=False) or hwnd
             c = _search_box_conf(hwnd2)
             if c >= 0.62:
-                logger.info(f"[搜索] 取消最大化后搜索框可匹配 (conf={c:.3f})，继续搜索")
+                logger.info(f"[搜索] 恢复窗口尺寸后搜索框可匹配 (conf={c:.3f})，继续搜索")
                 return True
-            logger.warning(f"[搜索] 取消最大化后仍只有 conf={c:.3f}")
+            logger.warning(f"[搜索] 恢复窗口尺寸后仍只有 conf={c:.3f}")
         hwnd = activate("微信", exact=True, logs=False) or hwnd
 
     # ---- 第 3 步：重启微信（窗口尺寸/渲染异常时的兜底手段）----
