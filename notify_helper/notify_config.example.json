@@ -1,0 +1,9 @@
+{
+    "webhook": "",
+    "webhook_secret": "",
+    "webhook_keyword": "",
+    "app_id": "cli_你的飞书应用AppID",
+    "app_secret": "你的飞书应用AppSecret",
+    "receive_id": "oc_目标群的chat_id",
+    "receive_id_type": "chat_id"
+}
