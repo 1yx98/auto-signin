@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-self_heal.py — 轻量纯规则自愈模块（借鉴 i西邮 healing_agent_v3，去掉 LLM 依赖）
+self_heal.py — 轻量纯规则自愈模块（不依赖 LLM，也不调外部 API）
 
-核心思路（来自 i西邮 v3.3.1）：
+核心思路：
   1. failure_key：对失败步骤+错误码去重，相同故障识别为同一类
   2. 预热动作库：已知 failure_code → 下次运行前自动执行对应清理/延长等待
   3. 冷却：同一 failure_code 连续 3 次失败后暂停预热，避免无效循环
   4. 成功后清零：签到成功则重置连续失败计数
 
-与 i西邮的区别：
+设计取舍：
   - 不调用 LLM（不依赖外部 API，离线可用）
   - 不自动改源码（风险高，由人工判断）
   - 预热动作仅限安全操作：杀进程、延长等待、清理小程序引擎
   - 所有动作 try/except，异常绝不影响主流程
 
-状态文件：.agent/heal_state.json（与 i西邮的 .agent/ 目录对齐）
+状态文件：.agent/heal_state.json
 信号文件：.agent/_extend_locate_wait、.agent/_wait_longer_detail（signin.py 读取）
 """
 

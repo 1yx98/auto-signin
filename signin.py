@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 油学通小程序自动签到脚本（搜索路径版 / 增强日志）
-流程（由 i西邮 版迁移改造，签到入口与模板请按油学通实际情况重新采集/校准）：
+流程（签到入口与模板按油学通实际界面采集/校准）：
   先确保有网：检测无外网时自动连接 XSYU_WLAN 并完成校园网认证
     （wifi_helper/wifi_auto_login.py，独立模块，失败不阻塞签到）
   启动/激活微信 -> 处理"进入微信"确认页 -> 顶部搜索框搜索"油学通"
@@ -167,7 +167,7 @@ sys.excepthook = _log_uncaught
 # 关键里程碑时间线：mark() 既打日志又记录，结束时统一汇总，便于一眼还原全过程
 T0 = time.time()
 TIMELINE = []
-GLOBAL_TIMEOUT = 900   # 全局运行上限15分钟，防止脚本卡死（i西邮用30分钟，我们签到流程更短）
+GLOBAL_TIMEOUT = 900   # 全局运行上限15分钟，防止脚本卡死（签到流程本身较短，15 分钟足够）
 def mark(event, level="info"):
     el = time.time() - T0
     TIMELINE.append((el, event))
@@ -1128,7 +1128,7 @@ def first_card_status_green(hwnd, title_cx, title_cy):
     '进行中-已签到'(绿)；历史已结束='已结束-已签到'(绿+橙)。返回 (bool, str 描述)。
     【2026-09-12 修复】必须同时检测红色'未签到'：红存在则强制返回 False，
     防止 ROI 偏移到下方已签卡片或绿色 UI 元素造成假阳性。
-    纯只读，不点击。借鉴 i西邮 v3.3.1 first_task_signed_in_list 思路。"""
+    纯只读，不点击。"""
     try:
         full = screen_bgr(); Hpx, Wpx = full.shape[:2]
         y1 = max(0, title_cy - 132); y2 = min(Hpx, title_cy - 55)
@@ -1208,7 +1208,7 @@ def open_signin_entry():
         if c >= CONFIDENCE:
             if topmost:
                 # 列表第一张卡片（当天记录）状态行已是绿色'已签到' → 今日已签/上一轮已签成功，
-                # 直接判定成功、不再进详情页重复签到（借鉴 i西邮 v3.3.1 列表已签短路）。
+                # 直接判定成功、不再进详情页重复签到（列表已签短路）。
                 h = activate(MINIAPP_TITLE, exact=True)
                 gok, gdesc = first_card_status_green(h, x, y)
                 if gok:
@@ -1692,7 +1692,7 @@ def click_sign_button():
                 logger.info(f"[确认] 尚未见到'已签到'，点详情页刷新按钮重新加载 第{refresh_clicks}次")
                 _wr = client_white_ratio(h)
                 if _wr > 0.85:
-                    logger.info(f"[确认] 窗口白色占比{_wr:.2f} 疑似白屏，本轮不点刷新，等待自然恢复（i西邮 9/5 教训：白屏点刷新只会更白）")
+                    logger.info(f"[确认] 窗口白色占比{_wr:.2f} 疑似白屏，本轮不点刷新，等待自然恢复（教训：白屏时点刷新只会更白）")
                     time.sleep(1.6); continue
                 tap_detail_refresh(h); last_refresh = time.time()
                 shot(f"确认中_刷新{refresh_clicks}")
