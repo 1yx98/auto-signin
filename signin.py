@@ -73,6 +73,8 @@ POPUP_CLOSE = abs_path(CONFIG.get("popup_close", "templates/06_popup_close.png")
 POPUP_TITLE = abs_path(CONFIG.get("popup_title", "templates/08_popup_title.png"))
 MINIAPP_SEARCH_ICON = abs_path(CONFIG["miniprogram_search_icon"])
 SEARCH_SCALES = (0.62, 0.72, 0.82, 0.92, 1.0, 1.1, 1.22)
+# 顶部搜索框模板的多尺度范围（窗口尺寸与采集时不同也能命中）
+SEARCH_BOX_SCALES = (0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15)
 # 多级入口（21/22/23/24）模板匹配的缩放范围：窗口大小与采集时不一致也能命中
 NAV_SCALES = (0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15)
 NAV_STEPS = []
@@ -897,6 +899,87 @@ def step_enter_wechat(allow_restart=True):
     shot("微信主界面就绪")
     return True
 
+# ===== 清遮挡时的系统窗口排除表（minimize_clutter 与 _minimize_windows_overlapping 共用）=====
+_COVER_SKIP_CLASS_PREFIXES = (
+    "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "NotifyIconOverflowWindow",
+    "ToolbarWindow32", "Progman", "WorkerW", "Windows.UI.Core.CoreWindow",
+    "Windows.Internal.SystemTray", "tooltips_class32", "msctfIME",
+    "ATL:", "CtrlNotifySink", "ReBarWindow32", "#32768",
+    "DUIWindow", "CaretWindow", "MSCTFIME UI", "IME",
+    "Windows.Internal.Shell", "TrayInputWnd", "TopLevelWindowForOverflow",
+)
+_COVER_SKIP_PROCS = {
+    "explorer.exe", "shellexperiencehost.exe", "searchui.exe", "searchhost.exe",
+    "runtimebroker.exe", "svchost.exe", "dwm.exe", "csrss.exe", "wininit.exe",
+    "services.exe", "lsass.exe", "smss.exe", "winlogon.exe", "system",
+    "registry", "memory compression", "vmmem", "vmmemwsl",
+    "securityhealthservice.exe", "securityhealthsystray.exe",
+    "widgetservice.exe", "gamebar.exe", "gamebarftserver.exe",
+    "textinputhost.exe", "ctfmon.exe", "tabtip.exe", "pen_tip.exe",
+    "sihost.exe", "taskhostw.exe", "dllhost.exe", "conhost.exe",
+    "openwith.exe", "pickershost.exe", "applicationframehost.exe",
+    "systemsettings.exe", "lockapp.exe", "startmenuexperiencehost.exe",
+    "shellappruntime.exe", "permissionshost.exe", "printdialog.exe",
+}
+# 微信主窗自身与小程序窗，清遮挡时绝不能动
+_COVER_KEEP_TITLES = {MINIAPP_TITLE, "微信", "油学通", "Program Manager",
+                      "任务栏", "运行", "开始"}
+
+
+def _minimize_windows_overlapping(wx_hwnd, min_area=8000):
+    """最小化任何与微信窗口有实质重叠的可见窗口（排除微信自身与系统窗口），返回数量。
+
+    【为什么需要】微信即使被设为 TOPMOST 且在前台，"总在最前"的小悬浮窗
+    （典型：QQ音乐桌面歌词）仍可能压在它上面——两个都是 TOPMOST 时 z 序不受
+    SetWindowPos 控制。而老的兜底逻辑只最小化"占微信整窗面积 >50%"的窗口，
+    这种几百像素宽的小悬浮窗永远够不到；可它盖住搜索框那一小块，
+    就足以让搜索框模板匹配失败（2026-09-14 20:55 的定时任务就是这么挂的，
+    匹配 conf 只有 0.522，阈值是 0.62）。
+
+    只在"搜索框体检不通过"时调用，所以正常情况下不会去动用户的任何窗口。
+    """
+    try:
+        wxl, wxt, wxr, wxb = win_rect(wx_hwnd)
+    except Exception:
+        return 0
+    if wxr - wxl < 100 or wxb - wxt < 100:
+        return 0
+    n = 0
+    for h, t in enum_windows(True):
+        title = t.strip()
+        if h == wx_hwnd or title in _COVER_KEEP_TITLES:
+            continue
+        try:
+            cls = _cls(h)
+        except Exception:
+            continue
+        if any(cls.startswith(sc) for sc in _COVER_SKIP_CLASS_PREFIXES):
+            continue
+        if _proc_name(h) in _COVER_SKIP_PROCS:
+            continue
+        if user32.IsIconic(h) or not user32.IsWindowVisible(h):
+            continue
+        try:
+            l, tt, r, b = win_rect(h)
+        except Exception:
+            continue
+        if l <= -30000 or (r - l) < 40 or (b - tt) < 20:
+            continue
+        ox1, oy1 = max(l, wxl), max(tt, wxt)
+        ox2, oy2 = min(r, wxr), min(b, wxb)
+        ov = max(0, ox2 - ox1) * max(0, oy2 - oy1)
+        if ov < min_area:
+            continue
+        try:
+            user32.ShowWindow(h, 6)   # SW_MINIMIZE
+            logger.warning(f"[前台] 最小化盖在微信上的窗口 {title!r} cls={cls!r} "
+                           f"rect=({l},{tt},{r},{b}) 重叠={ov}px²")
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
 def minimize_clutter():
     """保证微信前台不被遮挡：优先置顶微信（不最小化任何窗口，任务栏无变化）；
     置顶失败时才最小化真正遮挡微信的窗口（兜底）。严格排除系统窗口。"""
@@ -911,35 +994,24 @@ def minimize_clutter():
             user32.SetWindowPos(wx_hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002)
             time.sleep(0.3)
             if user32.IsWindowVisible(wx_hwnd) and fg_title() == "微信":
-                logger.info("[前台] 微信已置顶，无需最小化其他窗口（任务栏无变化）")
-                return 0
+                # 【重要】置顶 ≠ 没被挡。别的"总在最前"的悬浮窗（QQ音乐桌面歌词、
+                # 各种通知条）同样能压在微信上面；而脚本是拿**屏幕截图**做匹配的，
+                # 被挡住的区域就是匹配不上（2026-09-14 20:55 的定时任务就是这么挂的：
+                # 聊天窗口 + QQ音乐歌词盖住搜索框，模板 conf 只有 0.522，阈值 0.62）。
+                # 所以这里不再直接 return，照样清一遍真正盖在微信上的窗口。
+                n = _minimize_windows_overlapping(wx_hwnd)
+                if n:
+                    logger.info(f"[前台] 微信已置顶；另清理了 {n} 个盖在微信上的窗口")
+                else:
+                    logger.info("[前台] 微信已置顶，且没有被遮挡的窗口（任务栏无变化）")
+                return n
         except Exception:
             pass
     # 置顶失败（微信不可见/无法置顶），兜底：最小化遮挡微信的窗口
     me = fg_title()
-    kept_titles = {MINIAPP_TITLE, "微信", "油学通", "Program Manager",
-                   "任务栏", "运行", "开始", me}
-    skip_class_prefixes = (
-        "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "NotifyIconOverflowWindow",
-        "ToolbarWindow32", "Progman", "WorkerW", "Windows.UI.Core.CoreWindow",
-        "Windows.Internal.SystemTray", "tooltips_class32", "msctfIME",
-        "ATL:", "CtrlNotifySink", "ReBarWindow32", "#32768",
-        "DUIWindow", "CaretWindow", "MSCTFIME UI", "IME",
-        "Windows.Internal.Shell", "TrayInputWnd", "TopLevelWindowForOverflow",
-    )
-    skip_procs = {
-        "explorer.exe", "shellexperiencehost.exe", "searchui.exe", "searchhost.exe",
-        "runtimebroker.exe", "svchost.exe", "dwm.exe", "csrss.exe", "wininit.exe",
-        "services.exe", "lsass.exe", "smss.exe", "winlogon.exe", "system",
-        "registry", "memory compression", "vmmem", "vmmemwsl",
-        "securityhealthservice.exe", "securityhealthsystray.exe",
-        "widgetservice.exe", "gamebar.exe", "gamebarftserver.exe",
-        "textinputhost.exe", "ctfmon.exe", "tabtip.exe", "pen_tip.exe",
-        "sihost.exe", "taskhostw.exe", "dllhost.exe", "conhost.exe",
-        "openwith.exe", "pickershost.exe", "applicationframehost.exe",
-        "systemsettings.exe", "lockapp.exe", "startmenuexperiencehost.exe",
-        "shellappruntime.exe", "permissionshost.exe", "printdialog.exe",
-    }
+    kept_titles = set(_COVER_KEEP_TITLES) | {me}
+    skip_class_prefixes = _COVER_SKIP_CLASS_PREFIXES
+    skip_procs = _COVER_SKIP_PROCS
     if not wx_hwnd:
         logger.info("[前台] 未找到微信窗口，跳过遮挡清理")
         return 0
@@ -981,12 +1053,101 @@ def minimize_clutter():
         logger.info(f"[前台] 置顶失败，兜底最小化 {n} 个遮挡微信的窗口（重叠>50%）")
     return n
 
+def _search_box_conf(hwnd):
+    """当前微信窗口上部 30% 区域内、搜索框模板的最高匹配置信度；窗口异常时返回 -1。"""
+    try:
+        l, t, r, b = win_rect(hwnd)
+        if l <= -30000 or (r - l) < 200 or (b - t) < 200:
+            return -1.0
+        roi = (l, t, r, t + int((b - t) * 0.30))
+        c, _, _ = match(SEARCH_BOX_TPL, roi, scales=SEARCH_BOX_SCALES)
+        return c
+    except Exception:
+        return -1.0
+
+
+def _ensure_search_box_matchable():
+    """开跑前窗口体检：搜索框模板能不能匹配上；不行就分两步抢救，最后才放弃。
+
+    【为什么需要】2026-09-14 20:55 的定时任务整轮失败，原因不是代码而是**屏幕被挡**：
+    QQ音乐的桌面歌词悬浮窗（"总在最前"）压在微信上，正好盖住搜索框，
+    模板 conf 只有 0.522（阈值 0.62），后面粘贴、点结果全部落空。
+    同一台机器、普通窗口、没有悬浮窗时，同一模板 conf 是 0.78~0.80。
+
+    关键认知：脚本是拿**屏幕截图**做匹配的，看的是"屏幕上这块像素长什么样"，
+    不是"窗口内部长什么样"。所以任何盖在微信上的东西都会让它失效。
+
+    抢救顺序（从轻到重，都是实测有效的手段）：
+      1) 清遮挡：最小化所有与微信有实质重叠的可见窗口（排除系统窗口）——
+         解决"被悬浮歌词/弹窗/别的窗口盖住"，这是最常见的原因；
+      2) 重启微信：解决"窗口尺寸/渲染状态异常"（Qt 窗口最大化后外部改不回去，
+         只能靠重启恢复，实测重启后 conf 回到 0.72~0.80）。
+
+    返回 True=可匹配（或抢救后已恢复）；False=仍不行（多半要重采模板）。
+    """
+    hwnd = activate("微信", exact=True, logs=False)
+    if not hwnd:
+        logger.warning("[搜索] 窗口体检：找不到微信窗口")
+        return False
+    c = _search_box_conf(hwnd)
+    if c >= 0.62:
+        logger.info(f"[搜索] 窗口体检通过：搜索框可匹配 (conf={c:.3f})")
+        return True
+
+    # ---- 第 1 步：清掉盖在微信上的窗口 ----
+    logger.warning(f"[搜索] 窗口体检未通过：搜索框 conf={c:.3f}（阈值0.62）。"
+                   f"先清理盖在微信上的窗口再试（常见元凶：悬浮歌词、通知、别的窗口）")
+    try:
+        shot("搜索框体检失败_清遮挡前")
+    except Exception:
+        pass
+    n = _minimize_windows_overlapping(hwnd)
+    if n:
+        time.sleep(1.2)
+        hwnd2 = activate("微信", exact=True, logs=False) or hwnd
+        c = _search_box_conf(hwnd2)
+        if c >= 0.62:
+            logger.info(f"[搜索] 清理 {n} 个遮挡窗口后搜索框可匹配 (conf={c:.3f})，继续搜索")
+            return True
+        logger.warning(f"[搜索] 清理 {n} 个遮挡窗口后仍只有 conf={c:.3f}")
+    else:
+        logger.warning("[搜索] 没有找到盖在微信上的窗口")
+
+    # ---- 第 2 步：重启微信（窗口尺寸/渲染异常时的唯一恢复手段）----
+    logger.warning(f"[搜索] 重启微信以恢复窗口状态（当前 conf={c:.3f}）")
+    try:
+        shot("搜索框体检失败_重启微信前")
+    except Exception:
+        pass
+    try:
+        kill_wechat()
+    except Exception as e:
+        logger.warning(f"[搜索] 结束微信进程异常: {e}")
+    if not start_wechat():
+        logger.error("[搜索] 重启微信失败，无法恢复窗口状态")
+        return False
+    if not step_enter_wechat(allow_restart=False):
+        logger.error("[搜索] 重启微信后未能进入主界面")
+        return False
+    hwnd = activate("微信", exact=True, logs=False)
+    c = _search_box_conf(hwnd) if hwnd else -1.0
+    if c >= 0.62:
+        logger.info(f"[搜索] 重启微信后搜索框可匹配 (conf={c:.3f})，继续搜索")
+        return True
+    logger.warning(f"[搜索] 重启微信后搜索框仍匹配不上（conf={c:.3f}）——"
+                   f"模板可能已失效，建议运行 1_采集模板.bat 重采搜索框模板")
+    return False
+
+
 def open_miniprogram_by_search(retries=4):
     """直接点击微信顶部搜索框->粘贴->点'最近使用过的小程序'里的油学通。
     实测微信4.x下 Ctrl+F 打不开搜索、反复 Esc 会白屏，故两者都不用。"""
     minimize_clutter()
     close_stray_wechat_windows()
     reset_old_miniprogram()
+    # 窗口体检：搜索框匹配不上（典型是微信被最大化后半透明未渲染）就重启微信恢复，
+    # 否则后面 4 次重试全都会在同一个坏窗口上白费功夫（见该函数注释）。
+    _ensure_search_box_matchable()
     for attempt in range(1, retries + 1):
         logger.info(f"[搜索打开油学通] 第{attempt}/{retries}次尝试")
         hwnd = activate("微信", exact=True)
@@ -1023,7 +1184,7 @@ def open_miniprogram_by_search(retries=4):
         top_roi = (l, t, r, t + int((b - t) * 0.30))
         ok_sb, _ = wait_click(SEARCH_BOX_TPL, "顶部搜索框", timeout=6, threshold=0.62,
                               settle=1.0, roi=top_roi,
-                              scales=(0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15))
+                              scales=SEARCH_BOX_SCALES)
         if not ok_sb:
             logger.warning("[搜索] 未匹配到搜索框模板，仍尝试继续粘贴")
         time.sleep(0.4)
