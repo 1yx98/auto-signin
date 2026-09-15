@@ -1957,6 +1957,19 @@ def click_sign_button():
                 shot("详情页_疑似昨天已签")
                 TRACE.end_step("skipped", "YESTERDAY_RECORD")
                 return "not_time"
+            # 【2026-09-15 新增·第二道时间守卫】
+            # 已知限制：灰色「已签到」和灰色「已结束」在像素上无法区分（都是同款灰宽按钮）。
+            # 若页面停在【昨天那条"已结束"】记录上（小程序缓存没刷新），会被误判成"今天已签到"→ 假成功。
+            # 现在唯一的物理约束是时间：签到只可能在 [signin_time_start, signin_time_end] 内进行，
+            # 时段之外的"已签到"记录**不可能是今天签的**（今天的记录在时段外还没有"已签到"状态）。
+            # 因此：超出时段仍显示"已签到"→ 一律视为历史记录，判 not_time，绝不判成功。
+            if not _within_signin_window():
+                logger.warning(f"[详情页] 检测到灰色'已签到'，但当前不在签到时段"
+                               f"[{SIGNIN_TIME_START}~{SIGNIN_TIME_END}]内——该记录必然不是今天的，"
+                               f"判 not_time（防止把昨天'已结束'记录误判成今天已签）")
+                shot("详情页_时段外已签_疑历史记录")
+                TRACE.end_step("skipped", "OUT_OF_WINDOW_SIGNED")
+                return "not_time"
             logger.info("[详情页] 当前已是灰色'已签到'（今日已签/上一轮已签成功），直接判定成功")
             shot("详情页_已是已签到")
             TRACE.end_step("short_circuit", "DETAIL_ALREADY_SIGNED")

@@ -354,6 +354,22 @@ def test_signin_contracts():
         check("关键函数仍在 %s()" % fn, lambda fn=fn: fn in top_funcs or (_ for _ in ()).throw(
             AssertionError("找不到 %s()" % fn)))
 
+    # 详情页"已签到"判定必须同时受两道时间守卫保护
+    # 因为灰色「已签到」与灰色「已结束」像素上无法区分，只能靠时间去排除历史记录。
+    def time_guard_ok():
+        m = re.search(r"if signed_detail_button\(h, btns\):(.*?)(?=\n        if not green)", src, re.S)
+        body = m.group(1) if m else ""
+        if "before_signin_start()" not in body:
+            raise AssertionError("详情页'已签到'判定缺少 before_signin_start() 守卫")
+        if "_within_signin_window()" not in body:
+            raise AssertionError(
+                "详情页'已签到'判定缺少 _within_signin_window() 守卫！"
+                "时段外看到的'已签到'必然是历史记录（可能是昨天那条'已结束'），不能判成功。")
+        if "OUT_OF_WINDOW_SIGNED" not in body:
+            raise AssertionError("时段外判定没有走 not_time 分支")
+        return "双时间守卫齐全（未开始 + 时段外）"
+    check("详情页已签到判定有双时间守卫", time_guard_ok)
+
     def conservative_ok():
         m = re.search(r"def first_card_status_green\(.*?\n(?=def )", src, re.S)
         body = m.group(0) if m else ""
