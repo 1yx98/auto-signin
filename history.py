@@ -168,8 +168,13 @@ def stats(days=7, base_dir=None):
             out["success_rate"] = out["success"] * 100.0 / decided
 
         bits = []
-        bits.append("近 %d 天：成功 %d、失败 %d" % (days, out["success"], out["fail"]))
-        if out["not_time"]:
+        # "成功 0、失败 0" 在只有 not_time 记录时是废话，还会让人以为出问题。
+        # 所以只在真的有过成功或失败时才带这两个数字；否则只报"不在时段"。
+        if out["success"] or out["fail"] or out["other"]:
+            bits.append("近 %d 天：成功 %d、失败 %d" % (days, out["success"], out["fail"]))
+        elif out["not_time"]:
+            bits.append("近 %d 天：均不在签到时段" % days)
+        if out["not_time"] and (out["success"] or out["fail"] or out["other"]):
             bits.append("不在时段 %d" % out["not_time"])
         if out["fail_streak"] >= 2:
             bits.append("⚠️ 连续失败 %d 天" % out["fail_streak"])
