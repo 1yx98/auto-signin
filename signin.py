@@ -1832,38 +1832,88 @@ def _ocr_read(engine, bgr):
     return asyncio.run(_go())
 
 
-def ocr_button_text(full, btn, scales=(4, 3, 6, 5, 8)):
-    """裁出按钮→放大→OCR，返回读到的文字（读不到返回 ""）。
+def _ocr_pad_to_canvas(crop, pad_frac=0.22):
+    """把按钮裁图放到一块白色画布中央，四周留出白边。
 
-    【为什么要试多个倍数】实测（2026-09-15）各词的"最佳倍数"并不一致：
-        已签到    3x空   4x已签至刂  5x已签到   6x已签到   8x已签到
-        已结束    3x空   4x已结束    5x已结束   6x已结束   8x已结束
-        不在区域内 3x~8x 全部稳定
-    也就是说**单靠一个倍数会漏读**。这里按 4x→3x→6x→5x→8x 依次尝试，
-    只要某一档读到了"我们关心的关键词"就立刻返回（早退，省时间）。
-    最坏情况（全读不到）才会跑满 5 档，约 200ms —— 只在准备判成功时发生一次，可接受。
+    【为什么需要这一步 —— 2026-09-15 用真实样本实测】
+    同一个真实「已结束」按钮，在 10x 下：
+        裸按钮（无白边）        → 读不出 ✗
+        上下各留 ~10~20px 白边   → 读出「已结束」✓
+        左右各留 ~5px 白边       → 读出「已结束」✓
+    原因：Windows OCR 对"贴边"的文字不友好——文字紧贴图像边缘时，
+    引擎会把它当成被裁断的笔画。给它一圈留白，"字在图片中间"的样子，识别率立刻上去。
 
-    4x 排第一是因为它在实测里对「已签到」表现最好（5x 会退化成「已签至刂」）。
+    白边宽度按按钮高度比例给（默认 22%），这样按钮大小变化时行为一致。
+    """
+    try:
+        h, w = crop.shape[:2]
+        pad = max(6, int(h * pad_frac))
+        canvas = np.full((h + pad * 2, w + pad * 2, 3), 255, np.uint8)
+        canvas[pad:pad + h, pad:pad + w] = crop
+        return canvas
+    except Exception:
+        return crop
+
+
+def ocr_button_text(full, btn, scales=(10, 8, 6, 12, 4), pads=(0, -1, 1, 2)):
+    """裁出按钮→加白边→放大→OCR，返回读到的文字（读不到返回 ""）。
+
+    【这个函数是被真实样本一点点"教"出来的，改动前务必读完这段】
+    2026-09-15 拿到第一张真实「已结束」截图后才发现的规律：
+
+    一、放大倍数：**「已结束」比「已签到」难读得多**，两者不对称。
+        「已签到」 4x / 6x / 8x / 10x —— 几乎每档都读得出（实测覆盖率 ~92%）
+        「已结束」 **只有 10x 左右读得出**（低倍数全空）。实测覆盖率对比：
+                      遍历 1650 种裁图组合
+           已签到 命中 1928/2100 = 91.8%
+           已结束 命中   18/1650 =  1.1%
+        原因推测：「签到」笔画多、墨迹多，OCR 信号强；
+                  「结束」笔画少、字形简单，同样字号下信号弱，需要更大放大倍数。
+        → 所以 scales 里 **10 排第一**。漏读「已结束」的后果是**假成功（不可恢复）**，
+          必须优先照顾它，哪怕多花点时间。
+
+    二、**必须给白边**（这是最反直觉的一点）：
+        裸按钮贴边 → 读不出；四周留一圈白 → 读出。
+        见 _ocr_pad_to_canvas() 的说明。这一步是「已结束」能读出来的前提。
+
+    三、裁图边界很敏感：同一按钮，裁得偏十几像素就从"读得出"变"读不出"。
+        所以 pads 做 ±1/±2 微调。
+
+    四、**合成对照测不出上面任何一条**（合成图 6 档全对、真实样本只有 10x）。
+        真实样本回归在 smoke_test.test_ocr_real_samples()，改这个函数必须跑它。
+
+    命中关键词即早退；最坏跑满 4x5=20 档。实测在真实按钮上约 0.2~3 秒，
+    且只在"几何+字迹都过了、马上要判成功"时才发生一次。
     """
     eng = _ocr_get_engine()
     if eng is None or full is None or not btn:
         return ""
     try:
         H, W = full.shape[:2]
-        # 用按钮自身坐标裁（scan_buttons 已把 x/y 带回来了），留一点点内边距避开描边
-        x0 = max(0, btn["x"] - 4); y0 = max(0, btn["y"] - 4)
-        x1 = min(W, btn["x"] + btn["w"] + 4); y1 = min(H, btn["y"] + btn["h"] + 4)
-        if x1 - x0 < 20 or y1 - y0 < 10:
+        bx, by = btn["x"], btn["y"]
+        bw, bh = btn["w"], btn["h"]
+        if bw < 20 or bh < 10:
             return ""
-        crop = full[y0:y1, x0:x1]
         best = ""
-        for s in scales:
-            big = cv2.resize(crop, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
-            txt = _ocr_read(eng, big)
-            if txt and any(k in txt for k in _OCR_KEYWORDS):
-                return txt          # 读到关键词就收工
-            if txt and not best:
-                best = txt
+        for pad in pads:
+            x0 = max(0, bx - pad); y0 = max(0, by - pad)
+            x1 = min(W, bx + bw + pad); y1 = min(H, by + bh + pad)
+            if x1 - x0 < 20 or y1 - y0 < 10:
+                continue
+            crop = full[y0:y1, x0:x1]
+            # 加白边（关键步骤：解决"文字贴边读不出"）
+            padded = _ocr_pad_to_canvas(crop)
+            for s in scales:
+                try:
+                    big = cv2.resize(padded, None, fx=s, fy=s,
+                                     interpolation=cv2.INTER_CUBIC)
+                except Exception:
+                    continue
+                txt = _ocr_read(eng, big)
+                if txt and any(k in txt for k in _OCR_KEYWORDS):
+                    return txt          # 读到关键词就收工
+                if txt and not best:
+                    best = txt
         return best
     except Exception as e:
         logger.debug(f"[OCR] 单次识别失败（不否决，按'未知'处理）：{e}")

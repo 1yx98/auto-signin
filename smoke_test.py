@@ -948,6 +948,169 @@ def test_runtime():
 
 
 # =========================================================
+# 7. OCR 真实样本回归（可选：样本不在就跳过）
+# =========================================================
+def test_ocr_real_samples():
+    """用**真实截图**跑 OCR，验证「已签到」和「已结束」都能读对。
+
+    【为什么必须用真实样本】2026-09-15 的教训：
+    合成对照测试里「已结束」6 档全对，但**真实样本上低倍数全空、只有 10x 左右读得出**，
+    而且只要裁图贴边（不给白边）就立刻全空。
+    这两个问题合成测试**完全测不出来** —— 只有真实截图会暴露。
+    所以：合成验证用来测"最担心的误读方向"，真实样本用来测"到底读不读得出"，两者都要。
+
+    顺便暴露了量级差异：「已签到」遍历 2100 种裁图×倍数组合命中 91.8%，
+    「已结束」遍历 1650 种只命中 1.1% —— 后者是整条判据链路上最薄的一环，
+    靠上层的双时间守卫兜底。这个数字如实记录，不粉饰。
+
+    样本放在 logs/samples/（已 gitignore，含个人界面信息，不进仓库）。
+    没有样本时本组测试自动跳过，不会让冒烟测试失败。
+    """
+    samples_dir = os.path.join(HERE, "logs", "samples")
+    # 期望：(文件名关键字, 真值)
+    cases = [
+        ("已签到", "已签到"),
+        ("已结束", "已结束"),
+    ]
+    found_any = False
+    for key, truth in cases:
+        # 找该真值对应的样本
+        cands = []
+        if os.path.isdir(samples_dir):
+            for n in os.listdir(samples_dir):
+                if key in n and n.lower().endswith((".png", ".jpg", ".jpeg")):
+                    cands.append(os.path.join(samples_dir, n))
+        if not cands:
+            continue
+
+        def _run(cands=cands, truth=truth, key=key):
+            try:
+                import cv2
+                import numpy as np
+                sys.path.insert(0, HERE)
+                import signin
+            except Exception as e:
+                raise AssertionError("导入 OCR 相关模块失败: %s" % e)
+
+            eng = signin._ocr_get_engine()
+            if eng is None:
+                raise AssertionError(
+                    "OCR 引擎不可用（本机可能没装中文语言包）。"
+                    "该机器上第三路判据会静默跳过 —— 这本身不算错，"
+                    "但既然有真实样本，就应该能验证。请检查系统'语言设置'里的中文包。")
+
+            hits = []
+            for p in cands:
+                img = cv2.imdecode(np.fromfile(p, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if img is None:
+                    continue
+                H, W = img.shape[:2]
+                # 定位灰色按钮：优先用项目扫描逻辑（按整图当窗口）
+                orig = signin.win_rect
+                signin.win_rect = lambda h, W=W, H=H: (0, 0, W, H)
+                try:
+                    cap = []
+                    btns = signin.scan_buttons(None, grab_full=cap)
+                except Exception:
+                    btns = []
+                finally:
+                    signin.win_rect = orig
+                gray = [b for b in btns if b.get("kind") == "gray"]
+                if not gray:
+                    # 扫描失败时退回"按钮色块探测"（对这张样本实测有效）
+                    gray = _find_gray_bar(img)
+                if not gray:
+                    continue
+                btn = max(gray, key=lambda b: b.get("w", 0))
+                txt = signin.ocr_button_text(img, btn)
+                hits.append((os.path.basename(p), txt))
+
+            if not hits:
+                raise AssertionError("样本存在但没能定位到灰色按钮：%s" % cands)
+            good = [h for h in hits if truth in h[1]]
+            if not good:
+                raise AssertionError(
+                    "真实样本 OCR 全部未读出「%s」：%s\n"
+                    "      → 这会让第三路判据在该场景静默失效（漏掉否决 = 可能假成功）。"
+                    "检查 ocr_button_text() 的 scales/pads 组合是否覆盖了该样本。"
+                    % (truth, [(n, t) for n, t in hits]))
+            return "「%s」在 %d/%d 张真实样本上读出" % (truth, len(good), len(hits))
+        check("OCR 真实样本：「%s」能读出" % truth, _run)
+        found_any = True
+
+    if not found_any:
+        print("  [跳过] OCR 真实样本回归（logs/samples/ 下没有相应样本）")
+
+
+def _find_gray_bar(img, btn_aspect_min=4.0, btn_aspect_max=14.0):
+    """在整图里兜底找"灰色按钮"（当项目扫描逻辑因窗口尺寸假设不匹配而失败时用）。
+    返回 list[dict]，格式同 scan_buttons 的输出。
+
+    【2026-09-15 踩坑记录 —— 这个函数被真实样本改了三次，每次都是"看似能用但实际不行"】
+
+    版本 1（按灰带找）：扫描"整行灰色占比 > 0.5"的行 → 拼出灰带。
+        ✗ 全屏截图上误选**任务栏**（2880 宽）和全宽横带，而不是真按钮。
+
+    版本 2（加宽高比过滤）：排除占满图宽的长条，卡宽高比 4~14。
+        ✗ 真按钮只占 2880 宽里的 764，**整行灰占比只有 0.28**，
+          按 0.5 卡在全屏图上一个按钮都找不到（小图 0.93 却正常）。
+          → 教训：**阈值在不同尺寸的样本上会失效**，只拿小图校准必翻车。
+
+    版本 3（按"文字块"找，当前版本）：不再找灰带边界，而是**找按钮上的白字**。
+        白字(>238)在灰底(~204)上，用横向形态学闭运算把笔画拉成"文字块"，
+        然后看这个文字块周围是不是灰底。
+        ✓ 实测两张真实样本都精准命中，且"灰底占比"能把真按钮和标题栏分开：
+              真按钮文字块  灰底占比 0.88 / 0.89
+              标题栏文字块  灰底占比 0.01 / 0.02   ← 干净分离
+        这个思路对"按钮被更大灰区包住"、"按钮占图比例变化"都免疫。
+    """
+    import cv2
+    import numpy as np
+    H, W = img.shape[:2]
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    ink = ((g > 238) & (g < 256)).astype(np.uint8)          # 白字
+    bgm = ((g > 195) & (g < 215)).astype(np.uint8)          # 灰底
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 3))  # 横向拉通笔画
+    closed = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, k)
+    n, _lab, stats, _cent = cv2.connectedComponentsWithStats(closed, 8)
+
+    out = []
+    for i in range(1, n):
+        x, y, w, h, _area = stats[i]
+        # 文字块尺寸：实测「已签到」81x27、「已结束」81x27
+        if not (50 <= w <= 420 and 16 <= h <= 64):
+            continue
+        # 这块文字周围必须真的是灰底（这是区分"按钮文字"和"标题栏文字"的关键）
+        pad = 22
+        y0, y1 = max(0, y - pad), min(H, y + h + pad)
+        x0, x1 = max(0, x - pad), min(W, x + w + pad)
+        if bgm[y0:y1, x0:x1].mean() < 0.5:
+            continue
+        # 由文字块反推按钮：按钮以文字为中心，宽度约为文字块的 8~9 倍
+        # （实测：文字块 81 宽 → 按钮 764 宽，比例 9.4）；
+        # 高度按宽高比 4~14 约束，取"居中扩展"后的结果。
+        cx, cy = x + w // 2, y + h // 2
+        bw = int(w * 9.4)
+        bh = int(round(bw / 8.5))          # 真按钮宽高比实测 8.5
+        bx0, by0 = cx - bw // 2, cy - bh // 2
+        bx0 = max(0, min(bx0, W - bw)); by0 = max(0, min(by0, H - bh))
+        if bw < 40:
+            continue
+        # 注意：不能用 `bw > W * 0.9` 排除——在小图上按钮本来就几乎占满宽度
+        # （823 宽的小程序截图里按钮 764 宽 = 93%），这会误杀真按钮。
+        # 只排除"明显超过图宽"的异常值。
+        if bw > W:
+            continue
+        aspect = bw / float(bh)
+        if not (btn_aspect_min <= aspect <= btn_aspect_max):
+            continue
+        out.append(dict(kind="gray", x=int(bx0), y=int(by0), w=int(bw), h=int(bh),
+                        cx=int(cx), cy=int(cy), fill=1.0))
+    return out
+
+
+# =========================================================
 # main
 # =========================================================
 def main():
@@ -973,6 +1136,7 @@ def main():
     test_history()
     test_notify()
     test_runtime()
+    test_ocr_real_samples()
 
     print("\n" + "=" * 60)
     print("通过 %d 项，失败 %d 项" % (len(PASSED), len(FAILED)))
