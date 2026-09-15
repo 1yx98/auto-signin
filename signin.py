@@ -1574,15 +1574,40 @@ def first_card_status_green(hwnd, title_cx, title_cy):
         if has_red:
             return False, f"检测到红色'未签到'({red_desc})，强制未签 | {green_desc}"
         # ★第二道防线（2026-09-15）：绿块必须"像一段状态文字"，才敢判已签到。
-        # 状态行是「进行中 · 已签到」这类横排文字，特征：明显宽扁 + 填充实 + 不像零散斑块。
-        # 桌面壁纸/图标/UI 装饰的绿色往往是散点或不规则形状，用下面两条卡掉。
+        # 状态行是「进行中 · 已签到」这类横排文字，特征：明显宽扁 + **填充极实** + 不像零散斑块。
+        # 阈值依据（2026-09-15 实测，不是拍脑袋）：
+        #   · 真状态文字「已签到」: 77x28px 宽高比 2.75 填充率 **0.83**（近乎纯实心）
+        #   · 桌面壁纸青绿极光    : 77x34px 宽高比 2.26 填充率 **0.34~0.40**（斜纹有大量空隙）
+        # 两者在"填充率"上分离得很干净，取 0.55 居中：离壁纸上限 0.40 有 37% 余量，
+        # 离真值 0.83 也有充足空间。**不要把这条门槛调低**——它和防线①是互补关系。
+        # 另外要求绿块整体落在窗口内（双保险：万一 ROI 夹紧逻辑被改坏，这条还能兜住）。
         if has_green:
             w, h, px = best_g
             aspect = w / float(h) if h else 0
             fill = px / float(w * h) if (w and h) else 0
-            if aspect < 1.8 or fill < 0.35:
-                logger.warning(f"[列表已签] 绿块形状不像状态文字（{w}x{h} 宽高比={aspect:.2f} 填充率={fill:.2f}），"
-                               f"不予采信，按未签处理走完整流程验证")
+            # 绿块绝对坐标（ROI 左上角 + 块内偏移），用于校验它真的在窗口里
+            try:
+                _sub = full[y1:y2, x1:x2]
+                _hsv = cv2.cvtColor(_sub, cv2.COLOR_BGR2HSV)
+                _m = cv2.inRange(_hsv, (35, 70, 60), (87, 255, 255))
+                _m = cv2.morphologyEx(_m, cv2.MORPH_CLOSE, kern)
+                _cs, _ = cv2.findContours(_m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                bx = by = None
+                for _c in _cs:
+                    _x, _y, _w, _h = cv2.boundingRect(_c)
+                    if (_w, _h) == (w, h) and int((_m[_y:_y+_h, _x:_x+_w] > 0).sum()) == px:
+                        bx, by = x1 + _x, y1 + _y
+                        break
+                if bx is not None and rect:
+                    if bx < wl or bx + w > wr:
+                        logger.warning(f"[列表已签] 绿块@x[{bx},{bx+w}] 越出窗口 x[{wl},{wr}]（填充率{fill:.2f}），"
+                                       f"不予采信，按未签处理")
+                        return False, (f"绿块越出窗口@x[{bx},{bx+w}]，不判成功 | {green_desc}")
+            except Exception:
+                pass  # 坐标复核失败不阻断，仍由下面的形状门槛把关
+            if aspect < 1.8 or fill < 0.55:
+                logger.warning(f"[列表已签] 绿块形状不像状态文字（{w}x{h} 宽高比={aspect:.2f} 填充率={fill:.2f} "
+                               f"门槛=≥1.8/≥0.55），不予采信，按未签处理走完整流程验证")
                 return False, (f"绿块形状可疑({w}x{h} 比={aspect:.2f} 填={fill:.2f})，不判成功 | {green_desc}")
             return True, f"{green_desc}（宽比{aspect:.1f} 填充{fill:.2f} 无红色）"
         return False, f"无绿无红 | {green_desc} | {red_desc}"

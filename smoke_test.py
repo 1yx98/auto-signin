@@ -285,12 +285,22 @@ def test_signin_contracts():
         body = m.group(0) if m else ""
         if "aspect < 1.8" not in body:
             raise AssertionError("绿块判定没有宽高比检查，桌面绿色壁纸会被当成'已签到'")
-        if "fill < 0.35" not in body:
-            raise AssertionError("绿块判定没有填充率检查，大片纯色会被误判")
+        if "fill < 0.55" not in body:
+            raise AssertionError("绿块填充率门槛被调低了（应 ≥0.55）。实测依据：真状态文字填充率 0.83，"
+                                 "桌面青绿壁纸 0.34~0.40 —— 门槛低于 0.5 就拦不住壁纸，会重现假成功")
         if "return False" not in body.split("aspect < 1.8")[1][:400]:
             raise AssertionError("绿块形状可疑时没有返回 False（没按未签处理）")
-        return "宽高比≥1.8 且 填充率≥0.35 才采信"
+        return "宽高比≥1.8 且 填充率≥0.55 才采信"
     check("防线②：绿块形状必须像状态文字", green_shape_ok)
+
+    # 绿块必须整体落在窗口内（双保险：万一 ROI 夹紧被改坏，这条单独兜住）
+    def green_in_window_ok():
+        m = re.search(r"def first_card_status_green\(.*?\n(?=def )", src, re.S)
+        body = m.group(0) if m else ""
+        if "bx + w > wr" not in body:
+            raise AssertionError("绿块没有做'是否越出窗口'的独立校验（防线①被改坏时无兜底）")
+        return "绿块越出窗口即拒绝"
+    check("防线②补：绿块必须落在窗口内", green_in_window_ok)
 
     # 列表短路必须"宁可漏判也不误判"：拿不到窗口矩形时不许乐观判成功
     def conservative_ok():
