@@ -46,10 +46,44 @@ import time
 # 日志文件：每次运行都记录，方便排查
 _LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_run.log")
 _log_file = None
-try:
-    _log_file = open(_LOG_PATH, "w", encoding="utf-8")
-except Exception:
-    pass
+
+# 【2026-09-16 修复·P2-1】原来在**模块顶层**直接 `open(_LOG_PATH, "w")`。
+# 两个问题：
+#   1) import 即副作用：`python -c "import wifi_auto_login"` 或任何静态分析
+#      都会**当场截断 last_run.log** —— 上一次的排查现场就没了。
+#   2) 没有 `with`，也没注册退出钩子：若中途被强杀（taskkill /F），
+#      缓冲区里的日志可能没落盘，而"被强杀"恰恰是最需要看日志的时候。
+# 改为**懒打开 + atexit 兜底**：只有真的要写日志时才建文件，
+# 并且无论怎么退出（正常/异常/SystemExit）都保证 flush + close。
+def _open_log_lazy():
+    """首次写日志时才打开文件（避免 import 即截断上一次的现场）。"""
+    global _log_file
+    if _log_file is not None:
+        return _log_file
+    try:
+        _log_file = open(_LOG_PATH, "w", encoding="utf-8")
+        import atexit
+        atexit.register(_close_log)   # 强杀之外的所有退出路径都能善后
+    except Exception:
+        _log_file = None
+    return _log_file
+
+
+def _close_log():
+    """幂等关闭（重复调用安全）。"""
+    global _log_file
+    f, _log_file = _log_file, None
+    if f is not None:
+        try:
+            f.flush()
+        except Exception:
+            pass
+        try:
+            f.close()
+        except Exception:
+            pass
+
+
 import subprocess
 import urllib.request
 import urllib.parse
@@ -110,10 +144,11 @@ def _load_credentials():
 def _log(msg):
     line = f"[WiFi认证] {msg}"
     print(line, flush=True)
-    if _log_file:
+    f = _open_log_lazy()
+    if f:
         try:
-            _log_file.write(line + "\n")
-            _log_file.flush()
+            f.write(line + "\n")
+            f.flush()
         except Exception:
             pass
 
@@ -556,7 +591,7 @@ if __name__ == "__main__":
         if _log_file:
             _log_file.write(f"\n最终结果: success={ok} ssid={_current_ssid()} "
                             f"ip={_local_ip()} internet={has_internet()}\n")
-            _log_file.close()
+            _close_log()
     except Exception as e:
         import traceback
         err = traceback.format_exc()
@@ -565,7 +600,7 @@ if __name__ == "__main__":
         code = 2
         if _log_file:
             _log_file.write(f"\n异常: {e}\n{err}\n")
-            _log_file.close()
+            _close_log()
     if AUTO:
         sys.exit(code)
     try:

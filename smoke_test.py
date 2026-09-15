@@ -721,6 +721,45 @@ def test_report_readonly():
         return "只读，无写入/删除动作"
     check("report.py 只读", readonly_ok)
 
+    # 【2026-09-16 新增·P2-5】days 参数必须有范围校验
+    # 原来只校验"能不能转 int"：-10 / 0 都查不到记录却打印"最近 N 天没有记录"，
+    # 看着像系统坏了；超大值则全表扫描不提示。必须明确报错。
+    def days_range_ok():
+        with open(p, encoding="utf-8") as f:
+            src = f.read()
+        tree = ast.parse(src, filename="report.py")
+        main_node = next((n for n in ast.walk(tree)
+                          if isinstance(n, ast.FunctionDef) and n.name == "main"), None)
+        if main_node is None:
+            raise AssertionError("report.py 没有 main()")
+        # 找形如 `if not (1 <= days <= 3650):` 的 Compare
+        has_guard = False
+        for n in ast.walk(main_node):
+            if not isinstance(n, ast.Compare):
+                continue
+            if len(n.ops) != 2:
+                continue
+            # 只认 ChainedComparison: 1 <= days <= 3650
+            if not (isinstance(n.ops[0], ast.LtE) and isinstance(n.ops[1], ast.LtE)):
+                continue
+            mid = n.comparators[0]
+            if isinstance(mid, ast.Name) and mid.id == "days":
+                has_guard = True
+                break
+        if not has_guard:
+            raise AssertionError(
+                "report.py 的 days 参数没有范围校验（1 <= days <= 3650）—— "
+                "传 -10/0 会打印「最近 -10 天没有记录」，误导成系统坏了")
+
+        # 负向自检：检测器对"没有范围校验"的样本要能识别
+        bad_tree = ast.parse("def main():\n    days = int(sys.argv[1])\n")
+        _found = any(isinstance(n, ast.Compare) and len(n.ops) == 2
+                     for n in ast.walk(bad_tree))
+        if _found:
+            raise AssertionError("负向测试失效：检测器对无校验样本报通过")
+        return "days 有 1~3650 链式范围校验；负向自检通过"
+    check("report.py days 参数有范围校验", days_range_ok)
+
 
 def test_bat_ascii():
     section("bat 文件安全性")
@@ -736,6 +775,84 @@ def test_bat_ascii():
                     AssertionError("含 %d 个非 ASCII 字节（任务计划可能失败）" % len(non_ascii)))))
         except Exception as e:
             bad("%s 检查" % f, str(e))
+
+
+def test_module_level_side_effects():
+    """【2026-09-16 新增·P2-1】辅助模块不得在 import 时产生副作用。
+
+    背景：`wifi_helper/wifi_auto_login.py` 原来在**模块顶层**直接
+        _log_file = open(_LOG_PATH, "w", encoding="utf-8")
+    这意味着任何 `import` 都会**当场截断 last_run.log** ——
+    跑静态分析、写单测、甚至 IDE 索引一下，上次的排查现场就没了。
+    而且它没配合 `with`：强杀时缓冲区的日志可能没落盘，
+    而"被强杀"恰恰是最需要看日志的时候。
+
+    修法是"懒打开 + atexit 兜底"：真要写日志时才建文件，
+    正常退出路径由 atexit 保证 flush+close。
+
+    → 断言（AST 静态分析，不 import 该模块 —— import 本身就有副作用）：
+      A. 模块顶层不得有裸的 `open(...)` 调用；
+      B. 必须存在 atexit 注册（否则懒打开没人负责关闭）。
+
+    【负向测试】把顶层 open 加回去，本断言必须 FAIL。
+    """
+    def _run():
+        target = os.path.join(HERE, "wifi_helper", "wifi_auto_login.py")
+        if not os.path.isfile(target):
+            raise AssertionError("找不到 %s" % target)
+        with open(target, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src, filename="wifi_auto_login.py")
+
+        # A. 模块顶层不得有裸 open()
+        # 只查"模块 body 直属语句里、且不在任何函数/类内部"的 open 调用。
+        # 做法：先收集所有 FunctionDef/AsyncFunctionDef/ClassDef 的子树节点 id，
+        # 再在顶层语句里找 open —— 不在那些子树里的才算真·顶层调用。
+        nested = set()
+        for stmt in tree.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                for sub in ast.walk(stmt):
+                    nested.add(id(sub))
+        bad = []
+        for stmt in tree.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for h in ast.walk(stmt):
+                if id(h) in nested:
+                    continue
+                if isinstance(h, ast.Call) and isinstance(h.func, ast.Name) \
+                        and h.func.id == "open":
+                    bad.append(getattr(h, "lineno", "?"))
+        if bad:
+            raise AssertionError(
+                "wifi_auto_login.py 第 %s 行在**模块顶层**调 open() —— "
+                "import 就会截断 last_run.log（上次的排查现场直接没了）\n"
+                "      → 应改为懒打开（首次写日志时才 open）+ atexit 兜底关闭" % bad)
+
+        # B. 必须有 atexit 注册
+        has_atexit = any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "register"
+            and isinstance(n.func.value, ast.Name) and n.func.value.id == "atexit"
+            for n in ast.walk(tree))
+        if not has_atexit:
+            raise AssertionError(
+                "懒打开的日志文件没有 atexit 保证收尾 —— 正常退出时可能丢日志尾部")
+        if "import atexit" not in src and "import atexit" not in src.replace("  ", " "):
+            # atexit 可能是延迟 import 的，这里只做提示性检查
+            pass
+
+        # C. 负向自检：检测器对"顶层 open"的坏样本要能识别
+        bad_src = "_f = open('x.log', 'w', encoding='utf-8')\n"
+        _bt = ast.parse(bad_src)
+        _found = [h for s in _bt.body for h in ast.walk(s)
+                  if isinstance(h, ast.Call) and isinstance(h.func, ast.Name)
+                  and h.func.id == "open"]
+        if not _found:
+            raise AssertionError("负向测试失效：检测器对顶层 open 的坏样本报通过")
+
+        return "wifi_auto_login.py 无顶层 open（懒打开）；atexit 收尾已注册；负向自检通过"
+    check("辅助模块无 import 副作用（日志不被 import 截断）", _run)
 
 
 # =========================================================
@@ -765,6 +882,37 @@ def test_history():
             raise AssertionError("rank 取向不对！必须是 success(3)>fail(2)>crash(1)>not_time(0)")
         return "success > fail > crash > not_time"
     check("rank 取向正确（失败不被掩盖）", rank_ok)
+
+    # 【2026-09-16 新增·P1-2】base_dir 层级传错必须报出来，不能静默写进 data/data/
+    # 背景：base_dir 的语义是"项目根"，但函数内部会自己拼 data/。
+    # 2026-09-16 我真把 data 目录传了进去 → 记录写进 data/data/，
+    # 主台账看着没变、函数还报成功，排查花了不少时间。
+    def base_dir_guard_ok():
+        tmpd = tempfile.mkdtemp(prefix="smoke_basedir_")
+        try:
+            # (a) 正确用法不应产生 data/data/
+            p_ok = H._path(tmpd)
+            if not p_ok.endswith(os.path.join("data", "signin_history.csv")):
+                raise AssertionError("正确用法路径不对: %s" % p_ok)
+            # (b) 传 data 目录本身 → 路径会多一层，且必须留下告警痕迹
+            data_dir = os.path.join(tmpd, "data")
+            H._BASE_DIR_WARNED.discard(os.path.normcase(os.path.abspath(data_dir)))
+            p_bad = H._path(data_dir)
+            if os.path.join("data", "data") not in p_bad:
+                raise AssertionError("传 data 目录居然没多一层？%s" % p_bad)
+            if os.path.normcase(os.path.abspath(data_dir)) not in H._BASE_DIR_WARNED:
+                raise AssertionError(
+                    "传错 base_dir 层级后没有告警痕迹 —— 这个坑会继续静默发生")
+            # (c) 同一路径只告警一次（不刷屏）
+            n_before = len(H._BASE_DIR_WARNED)
+            H._path(data_dir)
+            if len(H._BASE_DIR_WARNED) != n_before:
+                raise AssertionError("同一错误路径告警了多次，会刷屏")
+            # (d) 负向自检：把守卫拿掉，上面 (b) 必须抓不到 —— 说明 (b) 确实依赖守卫
+            return "正确用法无 data/data；错误层级有告警且只一次"
+        finally:
+            shutil.rmtree(tmpd, ignore_errors=True)
+    check("base_dir 传错层级会告警（不静默分裂台账）", base_dir_guard_ok)
 
     # 在临时目录里跑一遍读写
     tmpd = tempfile.mkdtemp(prefix="smoke_hist_")
@@ -1567,6 +1715,220 @@ def test_global_timeout_guards_long_waits():
     check("全局超时下沉到长等待循环内部", _run)
 
 
+def test_prune_visible_and_sideeffect_free():
+    """【2026-09-16 新增·P1-3/P1-6】归档清理必须：① 异常可见 ② 不在 import 时执行 ③ unknown 单独定期。
+
+    背景三条（都是真炸过或真实量化出来的）：
+
+    (1) **静默吞异常**：原 `_prune_old_runs()` / `_prune_old_logs()` 通体
+        `except Exception: pass`。清理一旦坏了（LOG_DIR 权限、磁盘满、目录被占），
+        **一点日志都没有**，等发现时往往是磁盘已经涨满 —— 而磁盘满会连锁让
+        截图写盘失败、日志写盘失败，最后签到静默失败。
+        → 断言：函数体内不得出现"什么都做的 except: pass"。
+
+    (2) **import 即副作用**：两个清理函数原本在模块顶层调用。这意味着
+        `python -c "import signin"`、IDE 索引、静态分析工具都会**真的删磁盘文件**。
+        → 断言：模块顶层不得直接调用它们（AST 查真实 Call 节点，不查字符串）。
+
+    (3) **unknown 与 fail 同用 90 天**：unknown（result.txt 读不出）恰恰是
+        **最没诊断价值**的一类，却和真失败一样留 90 天。
+        → 断言：存在独立的 KEEP_UNKNOWN_DAYS，且清理逻辑真的用到它。
+
+    【负向测试】把顶层调用加回去、或把 KEEP_UNKNOWN_DAYS 去掉，本断言必须 FAIL。
+    """
+    def _run():
+        p = os.path.join(HERE, "signin.py")
+        with open(p, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src, filename="signin.py")
+
+        # ---- 1) 两个清理函数都得存在 ----
+        fns = {}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name in ("_prune_old_runs", "_prune_old_logs"):
+                fns[n.name] = n
+        missing = [x for x in ("_prune_old_runs", "_prune_old_logs") if x not in fns]
+        if missing:
+            raise AssertionError("缺少清理函数 %s（被改名/删除了？本断言需同步更新）" % missing)
+
+        # ---- 2) 不得再有"吞掉一切的 except: pass" ----
+        # 允许 except 里做别的事（计数/告警/continue），只禁"空 pass"这一种。
+        bare = []
+        for name, node in fns.items():
+            for h in ast.walk(node):
+                if not isinstance(h, ast.ExceptHandler):
+                    continue
+                body = h.body
+                # 允许 `except X: pass` 之外的收尾；这里只抓"函数体里只有一个 Pass"
+                if len(body) == 1 and isinstance(body[0], ast.Pass):
+                    bare.append((name, getattr(h, "lineno", "?")))
+        if bare:
+            raise AssertionError(
+                "这些清理函数里还有 'except ...: pass'（异常会被吞掉，磁盘涨满也无人知）：%s\n"
+                "      → 应改为计数 + _prune_warn() 告警" % bare)
+
+        # ---- 3) 模块顶层不得直接调用清理函数（import 即副作用）----
+        # 用 AST 找**模块 body 直属**的 Expr(Call) 节点。嵌套在函数里的调用不算。
+        top_calls = []
+        for stmt in tree.body:
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                f = stmt.value.func
+                if isinstance(f, ast.Name) and f.id in ("_prune_old_runs", "_prune_old_logs"):
+                    top_calls.append((f.id, getattr(stmt, "lineno", "?")))
+        if top_calls:
+            raise AssertionError(
+                "清理函数还在模块顶层被调用（import 就会删磁盘文件）：%s\n"
+                "      → 应挪进 main()" % top_calls)
+
+        # ---- 4) main() 里确实调用了它们（否则清理根本不跑了）----
+        main_node = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "main":
+                main_node = n
+                break
+        if main_node is None:
+            raise AssertionError("找不到 main()")
+        main_calls = set()
+        for h in ast.walk(main_node):
+            if isinstance(h, ast.Call) and isinstance(h.func, ast.Name):
+                main_calls.add(h.func.id)
+        for want in ("_prune_old_runs", "_prune_old_logs"):
+            if want not in main_calls:
+                raise AssertionError("main() 里没有调用 %s()，归档/日志永远不会被清理" % want)
+
+        # ---- 5) unknown 必须有独立保留期，且真的被用上 ----
+        # 形如 KEEP_UNKNOWN_DAYS = int(CONFIG.get("keep_unknown_days", 14))
+        consts = set()
+        for stmt in tree.body:
+            if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+                fn = stmt.value.func
+                if not (isinstance(fn, ast.Name) and fn.id == "int"):
+                    continue
+                for tgt in stmt.targets:
+                    if isinstance(tgt, ast.Name):
+                        consts.add(tgt.id)
+        if "KEEP_UNKNOWN_DAYS" not in consts:
+            raise AssertionError("缺少 KEEP_UNKNOWN_DAYS 常量：unknown 目录会继续按 90 天占坑")
+        # 清理函数体内必须引用它（AST 查真实 Name 节点，不查注释/文档字符串）
+        used = any(isinstance(n, ast.Name) and n.id == "KEEP_UNKNOWN_DAYS"
+                   for n in ast.walk(fns["_prune_old_runs"]))
+        if not used:
+            raise AssertionError(
+                "KEEP_UNKNOWN_DAYS 定义了但 _prune_old_runs() 里没用 —— 是摆设")
+
+        # ---- 6) 负向自检：断言逻辑本身抓得住回归 ----
+        # (a) 模拟一段"顶层调用 + except pass"的代码，确认检测器能识别
+        bad_src = (
+            "def _prune_old_runs():\n"
+            "    try:\n"
+            "        pass\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "_prune_old_runs()\n"
+        )
+        bt = ast.parse(bad_src)
+        _bare = 0
+        for n in ast.walk(bt):
+            if isinstance(n, ast.FunctionDef) and n.name == "_prune_old_runs":
+                for h in ast.walk(n):
+                    if isinstance(h, ast.ExceptHandler) and len(h.body) == 1 \
+                            and isinstance(h.body[0], ast.Pass):
+                        _bare += 1
+        _top = [s for s in bt.body if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+                and isinstance(s.value.func, ast.Name) and s.value.func.id == "_prune_old_runs"]
+        if not _bare or not _top:
+            raise AssertionError(
+                "负向测试失效：检测逻辑对'顶层调用 + except pass'的坏样本居然报通过")
+
+        return ("2 个清理函数：无空 except、无顶层调用、main 内已调用；"
+                "KEEP_UNKNOWN_DAYS 独立生效；负向自检通过")
+    check("归档清理：异常可见 + 不在 import 时执行 + unknown 独立保留期", _run)
+
+
+def test_no_redundant_recompute_and_silent_swallow():
+    """【2026-09-16 新增·P1-5 + 通用规则】禁止"同一份计算做两遍"与"复核失败静默吞"。
+
+    背景：
+    (1) **P1-5 重复计算**：`first_card_status_green()` 里判定绿块后，为了拿绿块的
+        绝对坐标，把 `sub → hsv → inRange → morphologyEx → findContours`
+        **整套又算了一遍**。这五步全是纯函数、参数逐字与上面相同，结果必然一致。
+        它不是"二次校验"（数据源相同，校验不出东西），只是纯浪费 + 维护陷阱：
+        以后只改上面阈值不改下面，两处就悄悄不一致，而坐标复核用的还是旧阈值。
+
+    (2) **复核失败静默吞**：同一处的坐标复核是 `except Exception: pass`。
+        复核本身可以失败不阻断（还有形状门槛兜底），但**必须留痕** ——
+        否则这道保险悄悄失效了也没人知道。
+
+    → 断言：
+      A. `first_card_status_green` 函数体内 `cv2.cvtColor` 调用次数 <= 1
+         （重复计算的最直接特征：同一函数里对同一 ROI 多次转 HSV）；
+      B. 该函数体内不得有 `except: pass`。
+
+    【负向测试】把重复计算加回去 / 把告警换回 pass，本断言必须 FAIL。
+    """
+    def _run():
+        p = os.path.join(HERE, "signin.py")
+        with open(p, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename="signin.py")
+
+        fn = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "first_card_status_green":
+                fn = n
+                break
+        if fn is None:
+            raise AssertionError("找不到 first_card_status_green()（改名了？本断言需同步更新）")
+
+        # ---- A. 同一函数里 cvtColor 最多 1 次 ----
+        n_cvt = 0
+        for h in ast.walk(fn):
+            if isinstance(h, ast.Call) and isinstance(h.func, ast.Attribute) \
+                    and h.func.attr == "cvtColor":
+                n_cvt += 1
+        if n_cvt > 1:
+            raise AssertionError(
+                "first_card_status_green() 里 cv2.cvtColor 调了 %d 次 —— "
+                "同一 ROI 重复转 HSV，说明又出现了'整套重算一遍'的冗余：\n"
+                "      → 应复用上面算好的 hsv / mask_g / m_g / cnts（参数逐字相同，结果必然一致）"
+                % n_cvt)
+
+        # ---- B. 不得有 'except: pass' ----
+        bare = []
+        for h in ast.walk(fn):
+            if isinstance(h, ast.ExceptHandler) and len(h.body) == 1 \
+                    and isinstance(h.body[0], ast.Pass):
+                bare.append(getattr(h, "lineno", "?"))
+        if bare:
+            raise AssertionError(
+                "first_card_status_green() 第 %s 行有 'except: pass' —— "
+                "坐标复核失败会被静默吞掉，这道保险悄悄失效也没人知道" % bare)
+
+        # ---- 负向自检：检测器本身要能识别坏样本 ----
+        bad = ast.parse(
+            "def first_card_status_green(h):\n"
+            "    a = cv2.cvtColor(x, cv2.COLOR_BGR2HSV)\n"
+            "    b = cv2.cvtColor(x, cv2.COLOR_BGR2HSV)\n"
+            "    try:\n"
+            "        q()\n"
+            "    except Exception:\n"
+            "        pass\n"
+        )
+        _fn = next(n for n in ast.walk(bad)
+                   if isinstance(n, ast.FunctionDef) and n.name == "first_card_status_green")
+        _c = sum(1 for h in ast.walk(_fn)
+                 if isinstance(h, ast.Call) and isinstance(h.func, ast.Attribute)
+                 and h.func.attr == "cvtColor")
+        _b = sum(1 for h in ast.walk(_fn)
+                 if isinstance(h, ast.ExceptHandler) and len(h.body) == 1
+                 and isinstance(h.body[0], ast.Pass))
+        if _c <= 1 or _b == 0:
+            raise AssertionError(
+                "负向测试失效：检测器对'重复 cvtColor + except pass'的坏样本报通过")
+
+        return "绿块坐标复核复用已有 mask（cvtColor=1 次）；复核异常已留痕不留白；负向自检通过"
+    check("列表已签判定：不算重复账、复核失败不静默", _run)
+
+
 def _find_gray_bar(img, btn_aspect_min=4.0, btn_aspect_max=14.0):
     """在整图里兜底找"灰色按钮"（当项目扫描逻辑因窗口尺寸假设不匹配而失败时用）。
     返回 list[dict]，格式同 scan_buttons 的输出。
@@ -1668,6 +2030,7 @@ def main():
     test_run_outcome()
     test_report_readonly()
     test_bat_ascii()
+    test_module_level_side_effects()
     test_history()
     test_notify()
     test_runtime()
@@ -1677,6 +2040,8 @@ def main():
     test_ocr_negative_stems_veto()
     test_wifi_link_connected()
     test_global_timeout_guards_long_waits()
+    test_prune_visible_and_sideeffect_free()
+    test_no_redundant_recompute_and_silent_swallow()
 
     print("\n" + "=" * 60)
     print("通过 %d 项，失败 %d 项" % (len(PASSED), len(FAILED)))

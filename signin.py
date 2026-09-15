@@ -111,7 +111,15 @@ def before_signin_start():
 
     config 里 signin_time_start 写坏时（不是 HH:MM）**保守返回 True**：
     宁可多走一遍详情页/判成"未开始"，也不要静默把昨天的记录当今天已签。
-    原来直接 `map(int, ...)`，配置写错会抛异常把整轮打挂。"""
+    原来直接 `map(int, ...)`，配置写错会抛异常把整轮打挂。
+
+    ★ 与 _within_signin_window() 的关系（两者的容错方向**相反**，但都对）：
+      本函数是"**早到守卫**"——配置读不出时返回 True（"还没到点"），
+        代价是多重跑一轮详情页；回报是绝不会把昨天的记录当今天已签。
+      _within_signin_window() 是"**晚走守卫**"——配置读不出时也返回 True（"还在窗内"），
+        代价是多跑一轮补救；回报是不会因为配置坏了就放弃补救。
+      同一个"保守"在两条路径上落到同一个返回值，是因为它要防的坏结果各不相同：
+        这里防"假成功"，那里防"漏补救"。**改任一个的容错方向前，先读另一个的注释。**"""
     try:
         h, m = map(int, str(SIGNIN_TIME_START).strip().split(":"))
     except Exception as e:
@@ -154,6 +162,10 @@ KEEP_DAYS = int(CONFIG.get("keep_days", 10))  # 日志最多保留天数（超�
 # 而且往往是"过几天才发现漏签"才去翻。所以失败目录按更长的天数保留，
 # 且不受 KEEP_RUNS 挤压（否则跑得多时会被"最近10次"挤掉）。
 KEEP_FAIL_DAYS = int(CONFIG.get("keep_fail_days", 90))
+# 【2026-09-16】"结果读不出来"的目录单独一档。它和真失败不一样：
+# 真失败有 result.txt / FAIL_ 截图，是**证据**；unknown 连 result.txt 都没有，
+# 往往是强杀留下的半截目录，几乎没诊断价值。给短保留期即可（14 天够翻一次）。
+KEEP_UNKNOWN_DAYS = int(CONFIG.get("keep_unknown_days", 14))
 
 
 def _run_outcome(run_dir):
@@ -186,14 +198,63 @@ def _run_outcome(run_dir):
     return "unknown"
 
 
+def _prune_warn(msg):
+    """清理阶段的告警出口。
+
+    【2026-09-16】为什么不用 logger：_prune_* 原本在模块顶层调用，
+    而 logger 要到 L256 才建好 —— 顶层调用时 logger 还不存在，
+    这正是当初写成 `except Exception: pass` 的原因（想报错也没地方报）。
+    现在虽然把调用挪进了 main()（logger 可用），仍保留 stderr 出口：
+    既让"import 即清理"的旧路径不炸，也统一走主程序收集 stderr 的通道（run.log）。
+    """
+    try:
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        logger.warning(msg)
+    except Exception:
+        pass
+
+
 def _prune_old_runs():
+    """清理过期的 run_* 运行目录。
+
+    返回 dict：
+      removed / kept        实际删掉、保留的目录数
+      fail_kept             保留期内的失败(crash/fail)目录数
+      unknown / unknown_kept / unknown_removed
+                            未判定结果的目录数（总数/保留/删除）
+      errors                删除失败的次数（每失败一个 +1）
+
+    【2026-09-16 修复·静默吞异常】原实现整体 `except Exception: pass`，
+    清理一旦坏了（LOG_DIR 权限、磁盘满、目录被占）**没有任何日志**，
+    等到发现时往往是磁盘已经涨满。现在：
+      · 单个目录删不掉 → 计数并写 stderr（不中断整体清理）
+      · 整体异常 → 写 stderr 并返回统计
+    另外把 unknown（读不出结果，多是强杀产物）单独计数 —— 它是个有价值的信号，
+    数量上涨说明"进程被强杀"在变频繁（配合强杀兜底一起看）。
+
+    【2026-09-16 修复·unknown 保留期】原实现把 unknown 与 fail 同样按
+    KEEP_FAIL_DAYS(90 天) 保留，理由是"conservative：多留现场"。
+    但这个推理有个洞：unknown 恰恰是**最不可能提供诊断价值**的一类 ——
+    它连 result.txt 都没写成，目录里往往只有半截截图甚至全空；
+    而真正的失败现场（FAIL_/result.txt=失败）本来就走 fail 通道保留了。
+    结果就是：每次强杀都留一个几乎无用的目录，90 天后才清，
+    慢慢把 logs/ 撑大。现在 unknown 单独用 KEEP_UNKNOWN_DAYS(14 天)：
+    足够人工回看，又不会长期占坑。
+    """
+    st = {"removed": 0, "kept": 0, "fail_kept": 0,
+          "unknown": 0, "unknown_kept": 0, "unknown_removed": 0, "errors": 0}
     try:
         dirs = sorted([d for d in os.listdir(LOG_DIR)
                        if d.startswith("run_") and os.path.isdir(os.path.join(LOG_DIR, d))], reverse=True)
         now = datetime.now()
-        # 失败目录用更长的保留期；成功/未知目录用原来的 KEEP_DAYS
+        # 失败目录用更长的保留期；成功目录和 unknown 目录用较短的
         fail_cutoff = now - timedelta(days=KEEP_FAIL_DAYS)
         ok_cutoff = now - timedelta(days=KEEP_DAYS)
+        unknown_cutoff = now - timedelta(days=KEEP_UNKNOWN_DAYS)
 
         protected = set()   # 还在保留期内的失败目录，绝不被 KEEP_RUNS 挤掉
         for d in dirs:
@@ -204,50 +265,113 @@ def _prune_old_runs():
             outcome = _run_outcome(os.path.join(LOG_DIR, d))
             is_fail = outcome in ("fail", "crash", "unknown")
             if is_fail:
+                # 【2026-09-16 修复·unknown 与 fail 同用 90 天】见下方注释
+                if outcome == "unknown":
+                    st["unknown"] += 1
+                    # unknown 是"结果读不出来"，多为强杀产物，也可能是成功的运行
+                    # 但 result.txt 没写成。它不值得按 90 天失败期保留（占空间没诊断价值），
+                    # 但也不该立刻删（可能包含唯一的现场）。折中用 KEEP_UNKNOWN_DAYS。
+                    if dt < unknown_cutoff:
+                        try:
+                            shutil.rmtree(os.path.join(LOG_DIR, d))
+                            st["removed"] += 1
+                            st["unknown_removed"] += 1
+                        except Exception as e:
+                            st["errors"] += 1
+                            _prune_warn("[清理] 删除未判定目录 %s 失败: %s" % (d, e))
+                    else:
+                        st["unknown_kept"] += 1
+                    continue
                 if dt < fail_cutoff:
-                    shutil.rmtree(os.path.join(LOG_DIR, d), ignore_errors=True)
+                    try:
+                        shutil.rmtree(os.path.join(LOG_DIR, d))
+                        st["removed"] += 1
+                    except Exception as e:
+                        st["errors"] += 1
+                        _prune_warn("[清理] 删除失败目录 %s 失败: %s" % (d, e))
                 else:
                     protected.add(d)
+                    st["fail_kept"] += 1
             else:
                 if dt < ok_cutoff:
-                    shutil.rmtree(os.path.join(LOG_DIR, d), ignore_errors=True)
+                    try:
+                        shutil.rmtree(os.path.join(LOG_DIR, d))
+                        st["removed"] += 1
+                    except Exception as e:
+                        st["errors"] += 1
+                        _prune_warn("[清理] 删除旧目录 %s 失败: %s" % (d, e))
 
         # 至少保留最近 KEEP_RUNS 次（失败目录已在上面单独判定，这里不参与挤压）
         remaining = sorted([d for d in os.listdir(LOG_DIR)
                             if d.startswith("run_") and os.path.isdir(os.path.join(LOG_DIR, d))
                             and d not in protected], reverse=True)
         for old in remaining[KEEP_RUNS:]:
-            shutil.rmtree(os.path.join(LOG_DIR, old), ignore_errors=True)
-    except Exception:
-        pass
-_prune_old_runs()
+            try:
+                shutil.rmtree(os.path.join(LOG_DIR, old))
+                st["removed"] += 1
+            except Exception as e:
+                st["errors"] += 1
+                _prune_warn("[清理] 删除超出保留次数的目录 %s 失败: %s" % (old, e))
+        st["kept"] = len(protected) + min(KEEP_RUNS, len(remaining))
+    except Exception as e:
+        st["errors"] += 1
+        _prune_warn("[清理] 清理旧运行目录整体失败（不影响签到）: %s: %s" % (type(e).__name__, e))
+    return st
 
 
 def _prune_old_logs():
     """清理过期的「按天汇总日志」signin_YYYYMMDD.log。
 
+    返回 {'removed', 'kept', 'errors'}。
+
     原来只清理 run_* 目录，按天日志从来不删、会一直长下去（每天约 40KB）。
     这里按 KEEP_DAYS 删旧日期，**今天的绝不动**（正被日志句柄占用，删也删不掉）。
     注意：`logs/task_run.log` 是 .bat 用 `>>` 重定向写的、脚本运行时一直被占用，
     既删不掉也轮转不了；它约 30KB/天、一年约 11MB，暂不处理。
+
+    【2026-09-16 修复·静默吞异常】原实现两层 `except Exception: pass`，
+    删不掉（文件被别处打开、只读属性）毫无痕迹。现改为逐个计数 + 告警。
+    另【P2-4】未来日期的文件名（时钟回拨 / 手工改名产物）不再被无条件跳过：
+    它们既不会被删，也不会静默消失，而是计入 `kept` 并单独告警一次 ——
+    时钟异常本身就是值得知道的事，不该被"继续"掉。
     """
+    st = {"removed": 0, "kept": 0, "errors": 0}
     try:
         today = datetime.now().strftime("%Y%m%d")
         cutoff = datetime.now() - timedelta(days=KEEP_DAYS)
+        future = []
         for n in os.listdir(LOG_DIR):
             if not (n.startswith("signin_") and n.endswith(".log")):
                 continue
             d = n[len("signin_"):-len(".log")]
             if d == today or len(d) != 8 or not d.isdigit():
+                st["kept"] += 1
                 continue
             try:
-                if datetime.strptime(d, "%Y%m%d") < cutoff:
-                    os.remove(os.path.join(LOG_DIR, n))
+                dt = datetime.strptime(d, "%Y%m%d")
             except Exception:
-                pass
-    except Exception:
-        pass
-_prune_old_logs()
+                st["kept"] += 1          # 8 位数字但不是合法日期（如 20261332），留着
+                continue
+            if dt > datetime.now():       # 未来日期：不删，但记一笔
+                future.append(n)
+                st["kept"] += 1
+                continue
+            if dt < cutoff:
+                try:
+                    os.remove(os.path.join(LOG_DIR, n))
+                    st["removed"] += 1
+                except Exception as e:
+                    st["errors"] += 1
+                    _prune_warn("[清理] 删除旧日志 %s 失败: %s: %s" % (n, type(e).__name__, e))
+            else:
+                st["kept"] += 1
+        if future:
+            _prune_warn("[清理] 发现 %d 个未来日期的日志文件（系统时钟可能被改过或手工改名）：%s"
+                        % (len(future), ", ".join(sorted(future)[:5])))
+    except Exception as e:
+        st["errors"] += 1
+        _prune_warn("[清理] 清理按天日志整体失败（不影响签到）: %s: %s" % (type(e).__name__, e))
+    return st
 
 # 步骤轨迹追踪器（纯观察，零副作用）：每次运行写 step_trace.json，机器可读失败定位
 TRACE = step_tracer.StepTracer(RUN_ID, RUN_DIR)
@@ -434,7 +558,19 @@ def net_state():
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=4) as r:
                 final = r.geturl() or ""
-                body = r.read(2048).decode("utf-8", "replace")
+                # 【2026-09-16 修复·P2-2】原来固定读 2048 字节。
+                # 风险（量级很小，但方向是"漏判门户"）：如果门户特征串出现在
+                # 第 2048 字节之后，就会被当成 'ok'（有外网）—— 而**漏判门户**
+                # 会让后续的 WiFi 认证自愈不触发，属于"该做的事没做"。
+                # 直接把上限提到 65536 而不是"再读一次"：这些探测源的实际响应体
+                # 要么是 0 字节（generate_204 成功）要么是几 KB 的重定向页/门户页，
+                # 64KB 足够覆盖全部真实情况，且只在"确实有 HTTP 响应"时才多读，
+                # 对超时/连接失败路径零影响。
+                #
+                # 注意：这里读的**不是**为了拿到完整正文，只为了找特征串；
+                # 遇到超大响应（比如挂了个下载页）也不会真的读满 ——
+                # urlopen 的 r.read(n) 最多读 n 字节就返回。
+                body = r.read(65536).decode("utf-8", "replace")
             if PORTAL_GATEWAY in final or any(m in body for m in PORTAL_MARKERS):
                 return "portal"
             return "ok"
@@ -718,20 +854,49 @@ def screen_bgr():
     return cv2.cvtColor(np.array(ImageGrab.grab()), cv2.COLOR_RGB2BGR)
 
 def client_white_ratio(hwnd):
-    """返回目标窗口区域内接近纯白像素的占比。微信4.x启动/切换时偶发渲染白屏，占比>0.85即判定白屏。"""
+    """返回目标窗口区域内接近纯白像素的占比；**返回 None 表示"测不了"**（不是白屏）。
+
+    【2026-09-16 修复·语义混淆】原来三种"测不了"的情况都 `return 1.0`：
+      · win_rect 返回哨兵值（窗口已销毁/最小化，坐标为 -32000 之类）
+      · 窗口完全在屏幕外（裁剪后区域为空）
+      · 取图/计算抛异常
+    而 1.0 等价于"判定为白屏"→ 调用方会去**杀微信重启**。可真实原因可能是
+    "窗口句柄已失效"，重启微信属于代价极高的错误自愈（约 40 秒 + 小程序重载的全部风险），
+    而且会把真正的错误掩盖掉。
+    现在把"测不了"与"真白屏"分开：None = 测不了，float = 真实占比。
+    **调用方必须先判 None**（见 is_white_screen()）。
+    """
     try:
         l, t, r, b = win_rect(hwnd)
         if l <= -30000 or t <= -30000:
-            return 1.0
+            return None          # 窗口已销毁/最小化 —— 不是白屏
         full = screen_bgr(); H, W = full.shape[:2]
         x1, x2 = max(0, l), min(W, r); y1, y2 = max(0, t), min(H, b)
         reg = full[y1:y2, x1:x2]
         if reg.size == 0:
-            return 1.0
+            return None          # 窗口完全在屏幕外 —— 不是白屏
         g = cv2.cvtColor(reg, cv2.COLOR_BGR2GRAY)
         return float((g > 240).mean())
-    except Exception:
-        return 1.0
+    except Exception as e:
+        logger.warning(f"[白屏] 白色占比测量失败，按'测不了'处理（不触发重启自愈）: {e}")
+        return None
+
+
+# 白屏判定阈值：>0.85 视为白屏（与原来一致，只是把"测不了"摘出去了）
+WHITE_RATIO_THRESHOLD = 0.85
+
+
+def is_white_screen(hwnd):
+    """窗口是否**确实白屏**。返回 (bool, ratio_or_None)。
+
+    **"测不了"一律按"不是白屏"处理** —— 因为白屏自愈的代价是杀掉微信进程重启，
+    不能因为"读不到窗口"就付这个代价。测不了时让调用方走"重新取窗口/继续等待"，
+    由后续的窗口有效性检查去暴露真正的问题。
+    """
+    wr = client_white_ratio(hwnd)
+    if wr is None:
+        return False, None
+    return (wr > WHITE_RATIO_THRESHOLD), wr
 
 def force_repaint(hwnd):
     """最小化再还原，强制窗口重新绘制（对暂时性白屏有效）"""
@@ -749,8 +914,10 @@ def wait_wechat_rendered(timeout=18, tag=""):
     while time.time() - t0 < timeout:
         hwnd = activate("微信", exact=True, logs=False)
         if hwnd:
-            wr = client_white_ratio(hwnd)
-            if wr < 0.85:
+            # 【2026-09-16】用 is_white_screen：测不了(None)按"未白屏"处理，
+            # 避免因为读不到窗口矩形就去杀微信重启（那是代价极高的错误自愈）。
+            white, wr = is_white_screen(hwnd)
+            if not white:
                 return hwnd
             logger.warning(f"[白屏] {tag} 窗口白色占比{wr:.2f}，界面尚未渲染，等待...")
         time.sleep(1.2)
@@ -760,8 +927,10 @@ def wait_wechat_rendered(timeout=18, tag=""):
                 logger.info("[白屏] 尝试最小化→还原强制重绘")
                 force_repaint(hwnd)
     hwnd = activate("微信", exact=True, logs=False)
-    if hwnd and client_white_ratio(hwnd) < 0.85:
-        return hwnd
+    if hwnd:
+        _white, _ = is_white_screen(hwnd)
+        if not _white:
+            return hwnd
     logger.error(f"[白屏] {tag} 等待{timeout}s后仍白屏")
     return None
 
@@ -1513,15 +1682,18 @@ def open_miniprogram_by_search(retries=4):
         ix = activate(MINIAPP_TITLE, exact=True)
         # 白屏检测：小程序冷启动偶发白屏，最多等15秒
         if ix:
-            _wr = client_white_ratio(ix)
-            if _wr > 0.85:
+            # 【2026-09-16】用 is_white_screen：测不了(None)按"未白屏"处理，
+            # 避免因读不到窗口而误判白屏、白白触发关闭重试。
+            _white, _wr = is_white_screen(ix)
+            if _white:
                 logger.info(f"[搜索] 窗口白屏(白色占比{_wr:.2f})，等待加载（最多15秒）")
                 _wt0 = time.time()
                 while time.time() - _wt0 < 15:
                     time.sleep(1.5)
                     ix = activate(MINIAPP_TITLE, exact=True)
-                    if ix and client_white_ratio(ix) <= 0.85:
-                        logger.info(f"[搜索] 窗口加载完成（白色占比{client_white_ratio(ix):.2f}）")
+                    _w2, _r2 = is_white_screen(ix) if ix else (False, None)
+                    if ix and not _w2:
+                        logger.info(f"[搜索] 窗口加载完成（白色占比{_r2 if _r2 is not None else 'n/a'}）")
                         break
                 else:
                     logger.warning("[搜索] 窗口15秒仍白屏，关闭后本轮重试")
@@ -1634,16 +1806,29 @@ def first_card_status_green(hwnd, title_cx, title_cy):
             aspect = w / float(h) if h else 0
             fill = px / float(w * h) if (w and h) else 0
             # 绿块绝对坐标（ROI 左上角 + 块内偏移），用于校验它真的在窗口里
+            #
+            # 【2026-09-16 修复·P1-5】这里原本把整套流程**又算了一遍**：
+            #     _sub = full[y1:y2, x1:x2]          ← 与上面 sub 完全相同
+            #     _hsv = cvtColor(_sub, ...)          ← 与上面 hsv 完全相同
+            #     _m   = inRange(_hsv, (35,70,60), ...) ← 与上面 mask_g 完全相同
+            #     _m   = morphologyEx(_m, CLOSE, kern)  ← 与上面 m_g 完全相同
+            #     _cs  = findContours(_m, ...)          ← 与上面 cnts 完全相同
+            # 四步全是纯函数、参数逐字相同，结果必然一致 —— 所以这不是"二次校验"，
+            # 只是**把同样的计算做了两遍**（同一张图、同一组阈值）。
+            #
+            # 代价：cvtColor + inRange + morphology 是 O(ROI 像素)。ROI 实测约
+            # 320x77 ≈ 2.5 万像素，多算一遍在秒级流程里不算灾难，但它发生在
+            # **每次列表页判定**时，属于纯浪费；更重要的是它制造了一个维护陷阱：
+            # 以后有人只改了上面 mask_g 的阈值、没改这里，两处就会**悄悄不一致**，
+            # 而"坐标复核"用的还是旧阈值 —— 这种不一致极难发现。
+            #
+            # 现在直接复用上面的 m_g / cnts。语义完全等价（同一份数据、同一次计算），
+            # 且消除了两处阈值漂移的可能。
             try:
-                _sub = full[y1:y2, x1:x2]
-                _hsv = cv2.cvtColor(_sub, cv2.COLOR_BGR2HSV)
-                _m = cv2.inRange(_hsv, (35, 70, 60), (87, 255, 255))
-                _m = cv2.morphologyEx(_m, cv2.MORPH_CLOSE, kern)
-                _cs, _ = cv2.findContours(_m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 bx = by = None
-                for _c in _cs:
+                for _c in cnts:
                     _x, _y, _w, _h = cv2.boundingRect(_c)
-                    if (_w, _h) == (w, h) and int((_m[_y:_y+_h, _x:_x+_w] > 0).sum()) == px:
+                    if (_w, _h) == (w, h) and int((m_g[_y:_y+_h, _x:_x+_w] > 0).sum()) == px:
                         bx, by = x1 + _x, y1 + _y
                         break
                 if bx is not None and rect:
@@ -1651,8 +1836,11 @@ def first_card_status_green(hwnd, title_cx, title_cy):
                         logger.warning(f"[列表已签] 绿块@x[{bx},{bx+w}] 越出窗口 x[{wl},{wr}]（填充率{fill:.2f}），"
                                        f"不予采信，按未签处理")
                         return False, (f"绿块越出窗口@x[{bx},{bx+w}]，不判成功 | {green_desc}")
-            except Exception:
-                pass  # 坐标复核失败不阻断，仍由下面的形状门槛把关
+            except Exception as _ce:
+                # 【2026-09-16】原来是 `except: pass`。复核失败不阻断流程（形状门槛仍在），
+                # 但必须留痕 —— 否则"坐标复核"悄悄失效了也没人知道，等于少了一道保险。
+                logger.warning(f"[列表已签] 绿块坐标复核异常（不阻断，仍有形状门槛把关）: "
+                               f"{type(_ce).__name__}: {_ce}")
             if aspect < 1.8 or fill < 0.55:
                 logger.warning(f"[列表已签] 绿块形状不像状态文字（{w}x{h} 宽高比={aspect:.2f} 填充率={fill:.2f} "
                                f"门槛=≥1.8/≥0.55），不予采信，按未签处理走完整流程验证")
@@ -2552,9 +2740,12 @@ def click_sign_button():
         logger.info(f"[定位页] {time.time()-t0:4.1f}s entered_map={entered_map} 已点完成={finish_clicks} "
                     f"按钮={[(x['kind'], x['cx'], x['cy']) for x in btns]}")
         if not btns:
-            _wr = client_white_ratio(h)
-            logger.info(f"[定位页] 本轮未扫到按钮，窗口白色占比={_wr:.2f}"
-                        + ("，>0.85 疑似白屏/页面未渲染" if _wr > 0.85 else "，非白屏：多为定位中且按钮颜色未达阈值，详见[扫描]调试行"))
+            # 【2026-09-16】仅用于日志：测不了(None)时如实写"n/a"，不再谎报 1.00
+            _white, _wr = is_white_screen(h)
+            _wr_txt = "n/a（测不到窗口）" if _wr is None else f"{_wr:.2f}"
+            logger.info(f"[定位页] 本轮未扫到按钮，窗口白色占比={_wr_txt}"
+                        + ("，>0.85 疑似白屏/页面未渲染" if _white else
+                           "，非白屏：多为定位中且按钮颜色未达阈值，详见[扫描]调试行"))
 
         # 1) 尚未提交：蓝色签到还在 = 仍停在详情页（旁边绿色是请假），补点蓝色进入地图页
         if finish_clicks == 0 and b2 and not entered_map:
@@ -2652,9 +2843,11 @@ def click_sign_button():
         logger.info(f"[确认] {time.time()-tv:4.1f}s 按钮={[(x['kind'], x['cx'], x['cy']) for x in btns]} "
                     f"已签到依据={'有' if sb else '无'}")
         if not btns:
-            _wr = client_white_ratio(h)
-            logger.info(f"[确认] 本轮未扫到按钮，窗口白色占比={_wr:.2f}"
-                        + ("，>0.85 疑似白屏/未回到详情页" if _wr > 0.85 else "，非白屏，详见[扫描]调试行"))
+            # 【2026-09-16】仅用于日志：测不了(None)时如实写"n/a"
+            _white, _wr = is_white_screen(h)
+            _wr_txt = "n/a（测不到窗口）" if _wr is None else f"{_wr:.2f}"
+            logger.info(f"[确认] 本轮未扫到按钮，窗口白色占比={_wr_txt}"
+                        + ("，>0.85 疑似白屏/未回到详情页" if _white else "，非白屏，详见[扫描]调试行"))
         if sb:
             confirm_rounds += 1
             if confirm_rounds >= 2:
@@ -2697,9 +2890,16 @@ def click_sign_button():
                     else:
                         logger.warning("[确认] 退出重进失败，继续点刷新按钮")
                 logger.info(f"[确认] 尚未见到'已签到'，点详情页刷新按钮重新加载 第{refresh_clicks}次")
-                _wr = client_white_ratio(h)
-                if _wr > 0.85:
+                # 【2026-09-16】三态处理，不再把"测不了"混进"白屏"：
+                #   None  → 窗口取不到矩形（多半已失效），本轮不动，等下一轮重新 activate
+                #   >0.85 → 确认白屏，跳过刷新（历史教训：白屏时点刷新只会更白）
+                #   其余  → 正常点刷新
+                _white, _wr = is_white_screen(h)
+                if _white:
                     logger.info(f"[确认] 窗口白色占比{_wr:.2f} 疑似白屏，本轮不点刷新，等待自然恢复（教训：白屏时点刷新只会更白）")
+                    time.sleep(1.6); continue
+                if _wr is None:
+                    logger.info("[确认] 白色占比测不到（窗口可能已失效），本轮不点刷新，等下一轮重新取窗口")
                     time.sleep(1.6); continue
                 tap_detail_refresh(h); last_refresh = time.time()
                 shot(f"确认中_刷新{refresh_clicks}")
@@ -2981,6 +3181,14 @@ def _within_signin_window():
     """当前是否还在签到时间窗内（用于决定要不要跑第三轮补救）。
 
     时间配置写坏/缺失时保守返回 True——宁可多跑一轮，也不要因为配置读不出来就放弃补救。
+
+    ★ 与 before_signin_start() 的关系（两者的容错方向**相反**，但都对）：
+      本函数是"**晚走守卫**"——配置读不出时返回 True（"还在窗内"），
+        代价是多跑一轮补救；回报是不会因为配置坏了就提前放弃。
+      before_signin_start() 是"**早到守卫**"——配置读不出时**也**返回 True（"还没到点"），
+        代价是多重跑一轮详情页；回报是绝不会把昨天的记录当今天已签。
+      两者同名"保守"却要防不同的坏结果（一个防漏补救、一个防假成功），
+      所以**不能简单地"统一容错方向"**。改任一个前先读另一个的注释。
     """
     try:
         hh1, mm1 = [int(x) for x in str(SIGNIN_TIME_START).split(":")]
@@ -3036,6 +3244,32 @@ def notify_feishu(reason=None):
 
 
 def main():
+    # 【2026-09-16 修复·P1-3】清理旧归档从**模块顶层**挪到这里。
+    #
+    # 原来 _prune_old_runs() / _prune_old_logs() 写在模块顶层，意味着
+    # **任何 import signin 都会删磁盘文件** —— 这是个隐藏的破坏性副作用：
+    #   · 写单测、跑静态分析工具、IDE 索引、`python -c "import signin"`，
+    #     都会莫名其妙触发一次删除；
+    #   · 更糟的是，清理逻辑依赖 LOG_DIR / KEEP_* / CONFIG，这些还是"导入过程中"
+    #     才建好的，任何顺序调整都可能让清理跑在半初始化状态上；
+    #   · 顶层调用还使 logger 不可用（logger 在 L307 才建），这才逼出了
+    #     `except Exception: pass`（想报错没地方报）。
+    # 挪进 main() 后：只在真正要签到的时候清一次，语义正确、可测、可观测。
+    try:
+        _pr = _prune_old_runs()
+        _pl = _prune_old_logs()
+        logger.info("[清理] 归档清理完成：删目录 %d / 留目录 %d（失败现场 %d、未判定 %d）"
+                    "/ 删日志 %d" % (_pr["removed"], _pr["kept"], _pr["fail_kept"],
+                                     _pr["unknown_kept"], _pl["removed"]))
+        if _pr["errors"] or _pl["errors"]:
+            logger.warning("[清理] 有 %d 个归档/日志删不掉（见上方 stderr 告警；不影响签到）"
+                           % (_pr["errors"] + _pl["errors"]))
+        # unknown 目录数是个"强杀频率"的代理指标：涨了就说明进程常被强杀。
+        if _pr["unknown"]:
+            logger.info("[清理] 其中「结果未判定」目录 %d 个（多为强杀残留，保留 %d 天）"
+                        % (_pr["unknown"], KEEP_UNKNOWN_DAYS))
+    except Exception as _pe:
+        logger.warning("[清理] 清理流程异常（不影响签到）: %s: %s" % (type(_pe).__name__, _pe))
     # 自愈预热：根据上次失败的 failure_code 自动执行安全清理/延长等待（纯规则，不依赖LLM）
     try:
         for _line in self_heal.preheat():

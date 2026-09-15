@@ -10,10 +10,17 @@
 - CSV 用 utf-8-sig 编码，Excel 双击直接能看，不会乱码。
 """
 import csv
+import logging
 import os
 import sys
 import time
 from datetime import datetime, timedelta
+
+# 【2026-09-16】本模块自己的 logger：连到根 logger 上。
+# 主程序配置了 handler 时会跟着一起写 run.log；没配置时什么都不做（不会报错）。
+# 为什么不用主程序的 logger 对象：**不能反向依赖** —— history.py 是纯工具模块，
+# 得能被单独导入（smoke_test 就单独 import 它），不能因为主程序没起好就炸。
+_LOG = logging.getLogger("signin.history")
 
 HISTORY_DIR = "data"
 HISTORY_FILE = "signin_history.csv"
@@ -46,8 +53,54 @@ _WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"]
 
 
 def _path(base_dir=None, name=None):
+    """拼出台账文件路径。
+
+    ★ `base_dir` 的语义是**项目根目录**，不是 `data` 目录 ——
+      函数内部会自己拼上 `HISTORY_DIR`(="data")。
+      传 `data` 进来 → 记录会写进 `data/data/`，台账**静默分裂**：
+      主台账看着没变、程序还报写入成功，非常难发现。
+      （2026-09-16 我真踩了这个坑，排查花了不少时间。见 _check_base_dir。）
+
+    【2026-09-16 修复·P1-2】加了 _check_base_dir() 自检：传错层级时
+    用 stderr 明确报出来，而不是默默新建一个平行目录。
+    """
     root = base_dir or os.path.dirname(os.path.abspath(__file__))
+    _check_base_dir(root)
     return os.path.join(root, HISTORY_DIR, name or HISTORY_FILE)
+
+
+_BASE_DIR_WARNED = set()
+
+
+def _check_base_dir(root):
+    """【2026-09-16 新增】拦"把 data 当项目根传进来"这类层级错误。
+
+    判据：`os.path.basename(root)` 恰好等于 HISTORY_DIR（即 "data"）。
+    这不是 100% 严谨（理论上可以有别的叫 data 的根目录），但这是唯一
+    被真实踩到过的错法，且**误报代价极低**（只多一行 stderr 告警）。
+
+    同一路径只告警一次（_BASE_DIR_WARNED），避免每条记录都刷屏。
+    """
+    try:
+        if os.path.basename(os.path.normpath(root)) != HISTORY_DIR:
+            return
+        key = os.path.normcase(os.path.abspath(root))
+        if key in _BASE_DIR_WARNED:
+            return
+        _BASE_DIR_WARNED.add(key)
+        msg = ("[台账] base_dir 传的是 data 目录本身（%s），但它的语义是**项目根目录**；"
+               "记录会被写进 %s\\data\\，与主台账分裂。" % (root, root))
+        try:
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            _LOG.warning(msg)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def _append_row(path, row, need_header):
