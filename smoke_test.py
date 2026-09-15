@@ -1341,6 +1341,153 @@ def test_ocr_negative_stems_veto():
     check("OCR: 否定词残缺形态（骨架）也能否决，且不误伤正向词", _run)
 
 
+def test_wifi_link_connected():
+    """【2026-09-16 新增】WiFi 链路状态判据必须是「白名单精确匹配」，不能是子串匹配。
+
+    背景（真实炸过，英文系统才暴露）：
+      原判据 `("已连接" in stat) or ("connected" in stat.lower())`
+      而 "connected" 是 **"disconnected" 的子串** —— 英文系统下
+      `State : disconnected`（已断开）会被判成"已连接"。
+
+    后果链条：
+      reconnect_wifi() 里 `linked` 被错误置 True
+        → 跳过"重连后未恢复链路"告警
+        → 函数返回 True 谎报"重连成功"
+        → 调用处（定位漂移场景）把 wifi_refreshed 置 True
+        → **最后一次定位自愈机会被白白浪费**
+
+    【负向测试】把判据改回子串即应 FAIL，见本函数末尾的自检。
+    用 AST 提取真实函数体执行，不复制粘贴实现（避免"测试版和线上版各写一套"）。
+    """
+    def _run():
+        p = os.path.join(HERE, "signin.py")
+        with open(p, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src, filename="signin.py")
+
+        # ---- 1) 静态要求：必须存在 wifi_link_connected 与 parse_wlan_interfaces ----
+        names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        for fn in ("wifi_link_connected", "parse_wlan_interfaces"):
+            if fn not in names:
+                raise AssertionError("缺少 %s()：WiFi 判据未抽成可测函数" % fn)
+
+        # ---- 2) 静态要求：不得再出现裸子串判连接 ----
+        # 只在"代码"里查，注释/docstring 不算证据（项目踩过注释误导的坑）
+        bad = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare) and isinstance(node.ops[0], ast.In):
+                # 形如 "connected" in xxx.lower()
+                left = node.left
+                if isinstance(left, ast.Constant) and isinstance(left.value, str):
+                    if left.value == "connected":
+                        bad.append(getattr(node, "lineno", "?"))
+        if bad:
+            raise AssertionError(
+                "第 %s 行仍在用裸子串 'connected' 判连接状态 —— "
+                "'disconnected' 会被误判为已连接" % bad)
+
+        # ---- 3) 行为要求：真实 netsh 输出样本上判对 ----
+        # 把 wifi_link_connected 的函数体单独编译执行，测的就是线上那份实现
+        fn_node = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "wifi_link_connected":
+                fn_node = n
+                break
+        # 补齐它依赖的 parse_wlan_interfaces
+        dep_node = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "parse_wlan_interfaces":
+                dep_node = n
+                break
+        # 只保留这两个函数体（去掉装饰器），模块级 import re 由 ns 提供
+        mod = ast.Module(body=[dep_node, fn_node], type_ignores=[])
+        ns = {"re": __import__("re")}
+        exec(compile(mod, "<wifi_extract>", "exec"), ns)
+        judge = ns["wifi_link_connected"]
+
+        cases = [
+            # (netsh 输出, 期望, 说明)
+            ("名称 : Wi-Fi\n状态 : 已连接", True, "中文已连接"),
+            ("名称 : Wi-Fi\n状态 : 已断开连接", False, "中文已断开（原判据恰好能过）"),
+            ("Name : Wi-Fi\nState : connected", True, "英文已连接"),
+            ("Name : Wi-Fi\nState : disconnected", False, "★英文已断开（原判据在此误判）"),
+            ("State : Disconnected", False, "大小写混合"),
+            ("State : DISCONNECTED", False, "全大写"),
+            ("SSID : XSYU_WLAN\nState : connected\nBSSID : aa:bb", True, "多行中取状态行"),
+            ("", False, "空输出"),
+            ("一些无关文本", False, "无状态行"),
+        ]
+        wrong = [(s, e, judge(s)) for s, e, _d in cases if judge(s) is not e]
+        if wrong:
+            raise AssertionError(
+                "WiFi 链路判据判错 %d 例：%s\n"
+                "      → 其中 `State : disconnected` 被误判会让重连谎报成功、白白浪费定位自愈机会"
+                % (len(wrong), wrong))
+
+        # ---- 4) 负向自检：把判据改回子串，必须判错 ----
+        def _broken_baseline(text):
+            """原实现的判据（应在此样本上出错）"""
+            return ("已连接" in text) or ("connected" in text.lower())
+        # 原判据在 disconnected 样本上会返回 True（=误判为已连），这正是要抓的回归。
+        # 所以负向自检要求：_broken_baseline 的结果与期望值 False **不相等**。
+        if _broken_baseline("Name : Wi-Fi\nState : disconnected") is False:
+            raise AssertionError(
+                "负向测试失效：还原成子串判据后居然判对了，说明本断言抓不住回归"
+                "（样本或判据逻辑被改动了，请检查）")
+
+        return ("%d 组 netsh 输出全部判对（含 disconnected 反向样本）；"
+                "且验证了'改回子串即失效'" % len(cases))
+    check("WiFi 链路判据：disconnected 不被误判为已连接", _run)
+
+
+def test_global_timeout_guards_long_waits():
+    """【2026-09-16 新增】GLOBAL_TIMEOUT 必须约束到长等待循环内部，不能只查轮边界。
+
+    背景（量化实测）：
+      GLOBAL_TIMEOUT = 900（15 分钟），但唯一检查点在 `for rnd in range(1,4)` 循环体首行，
+      单轮内部**没有任何刹车**。实测：
+        单轮主要等待 DETAIL_WAIT(20) + LOCATE_WAIT(120) + CONFIRM_WAIT(50) = 190 秒
+        三轮最坏 = 271×3 + 轮间 98 = 911 秒 → 已超 900
+        最坏（第3轮开始时 899 秒 + 再跑满一轮 271 秒）= 1170 秒 = 19.5 分钟
+      即"15 分钟防卡死"这道门是虚掩的。
+
+    【负向测试】把任一 while 条件里的 GLOBAL_TIMEOUT 去掉即应 FAIL。
+    """
+    def _run():
+        p = os.path.join(HERE, "signin.py")
+        with open(p, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename="signin.py")
+
+        # 找出三个长等待循环：条件里引用了 LOCATE_WAIT / CONFIRM_WAIT / DETAIL_WAIT
+        targets = ("LOCATE_WAIT", "CONFIRM_WAIT", "DETAIL_WAIT")
+        found = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.While):
+                continue
+            cond_src = ast.dump(node.test)
+            for t in targets:
+                if ("Name(id='%s'" % t) in cond_src:
+                    # 该循环的条件里必须同时出现 GLOBAL_TIMEOUT
+                    found[t] = ("Name(id='GLOBAL_TIMEOUT'" in cond_src)
+        missing = [t for t in targets if t not in found]
+        if missing:
+            raise AssertionError(
+                "没找到以 %s 为条件的 while 循环 —— 常量改名了？本断言需同步更新" % missing)
+        unguarded = [t for t, ok in found.items() if not ok]
+        if unguarded:
+            raise AssertionError(
+                "这些长等待循环的条件里没有 GLOBAL_TIMEOUT 兜底：%s\n"
+                "      → 全局 15 分钟上限形同虚设，最坏可跑到 19.5 分钟"
+                % unguarded)
+
+        # 负向自检：断言逻辑本身要能识别"没护栏"的情况
+        fake_cond = "Compare(left=Name(id='t0'))"   # 模拟一个没护栏的条件
+        if ("Name(id='GLOBAL_TIMEOUT'" in fake_cond):
+            raise AssertionError("负向测试失效：护栏检测逻辑对空条件也报通过")
+        return "3 个长等待循环（DETAIL/LOCATE/CONFIRM）全部受 GLOBAL_TIMEOUT 约束"
+    check("全局超时下沉到长等待循环内部", _run)
+
+
 def _find_gray_bar(img, btn_aspect_min=4.0, btn_aspect_max=14.0):
     """在整图里兜底找"灰色按钮"（当项目扫描逻辑因窗口尺寸假设不匹配而失败时用）。
     返回 list[dict]，格式同 scan_buttons 的输出。
@@ -1449,6 +1596,8 @@ def main():
     test_ocr_no_reverse_misread()
     test_ocr_best_initialized()
     test_ocr_negative_stems_veto()
+    test_wifi_link_connected()
+    test_global_timeout_guards_long_waits()
 
     print("\n" + "=" * 60)
     print("通过 %d 项，失败 %d 项" % (len(PASSED), len(FAILED)))

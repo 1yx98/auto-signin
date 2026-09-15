@@ -363,14 +363,58 @@ def ac_power_online():
     except Exception:
         return None, None
 
+def parse_wlan_interfaces(text):
+    """解析 `netsh wlan show interfaces` 的输出，返回 {'ssid','profile','state'}（取不到为 ""）。
+
+    【2026-09-16 新增】抽出公共解析器，解决两处口径不一致：
+      · current_wifi_ssid()  原来用 startswith("ssid")，会把 "BSSID" 行也当 SSID（靠额外排除兜）
+      · reconnect_wifi()     原来用 line.split(":",1) + 精确键名，且只认 "配置文件" 不认英文
+    统一后：键名大小写不敏感、中英文都认、state 单独归一化（供连接状态判断用）。
+    """
+    out = {"ssid": "", "profile": "", "state": ""}
+    for line in (text or "").splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        k = key.strip().lower()
+        v = val.strip()
+        if not v:
+            continue
+        # 注意：必须先判 BSSID，否则 "bssid".startswith("ssid") 为假但键名含 ssid 会被误收
+        if k == "ssid" and not out["ssid"]:
+            out["ssid"] = v
+        elif k in ("profile", "配置文件") and not out["profile"]:
+            out["profile"] = v
+        elif k in ("state", "状态") and not out["state"]:
+            out["state"] = v.strip().lower()
+    return out
+
+
+def wifi_link_connected(text):
+    """从 netsh 输出判断链路是否**已连接**。白名单精确匹配，杜绝子串误判。
+
+    【2026-09-16 修复·子串误判】原来判据是 `("connected" in stat.lower())`，
+    而 "connected" 是 "disconnected" 的子串 —— 英文系统下 "State : disconnected"
+    （已断开）会被判成"已连接"，导致 reconnect_wifi() 谎报成功、
+    并让 wifi_refreshed 置 True 把最后一次定位自愈机会浪费掉。
+    改为"取状态行 + 白名单"，并显式排除否定词。
+    """
+    st = parse_wlan_interfaces(text).get("state", "")
+    if st:
+        # 归一化：只认白名单，其余（含 disconnected / 已断开连接）一律算未连
+        return st in ("connected", "已连接")
+    # 拿不到标准状态行时，退回全文否定词优先判断（保守：词面出现"断开/未连接"即不算已连）
+    low = (text or "").lower()
+    if "已断开" in low or "未连接" in low or "disconnected" in low:
+        return False
+    return ("已连接" in low) or bool(re.search(r"\bconnected\b", low))
+
+
 def current_wifi_ssid():
     try:
         r = subprocess.run(["netsh", "wlan", "show", "interfaces"], capture_output=True,
                            text=True, encoding="gbk", errors="ignore", timeout=8)
-        for line in (r.stdout or "").splitlines():
-            _s = line.strip().lower()
-            if _s.startswith("ssid") and "bssid" not in _s:  # 排除 BSSID 行
-                return line.split(":", 1)[1].strip()
+        return parse_wlan_interfaces(r.stdout or "").get("ssid") or None
     except Exception as _e:
         logger.debug("[WiFi] 读取 SSID 失败: %s" % _e)
     return None
@@ -2201,18 +2245,8 @@ def reconnect_wifi():
                                encoding=enc, errors="ignore")
             return (p.stdout or "") + (p.stderr or "")
         info = _netsh("show", "interfaces")
-        ssid = profile = None
-        for line in info.splitlines():
-            s = line.split(":", 1)
-            if len(s) != 2:
-                continue
-            key, val = s[0].strip().lower(), s[1].strip()
-            if not val:
-                continue
-            if key in ("ssid",) and ssid is None:
-                ssid = val
-            if key in ("profile", "配置文件") and profile is None:
-                profile = val
+        _w = parse_wlan_interfaces(info)
+        ssid, profile = (_w["ssid"] or None), (_w["profile"] or None)
         if not profile:
             logger.warning("[WiFi重连] 未能解析当前 WiFi 配置文件，跳过重连")
             return False
@@ -2225,8 +2259,13 @@ def reconnect_wifi():
         linked = False
         for _ in range(12):  # 最多等 24 秒恢复链路关联
             time.sleep(2)
-            stat = _netsh("show", "interfaces")
-            if ("已连接" in stat) or ("connected" in stat.lower()):
+            # 【2026-09-16 修复·子串误判】原来判据是 `("connected" in stat.lower())`，
+            # 而 "connected" 是 "disconnected" 的子串 —— 英文系统下
+            # "State : disconnected"（已断开）会被判成"已连接"，导致：
+            #   ① 跳过"未恢复链路"告警分支；② wifi_refreshed 被置 True，
+            #   最后一次定位自愈机会被白白浪费，函数还返回 True 谎报成功。
+            # 改用 wifi_link_connected()：取状态行 + 白名单精确匹配。
+            if wifi_link_connected(_netsh("show", "interfaces")):
                 linked = True; break
         if not linked:
             logger.warning("[WiFi重连] 重连后未在限定时间内恢复链路连接")
@@ -2424,7 +2463,7 @@ def click_sign_button():
     finish_clicks = 0
     blue = green = gray = None
     t0 = time.time()
-    while time.time() - t0 < DETAIL_WAIT:
+    while time.time() - t0 < DETAIL_WAIT and (time.time() - T0) < GLOBAL_TIMEOUT:
         h = activate(MINIAPP_TITLE, exact=True)
         _cap = []
         btns = scan_buttons(h, grab_full=_cap) if h else []
@@ -2499,7 +2538,12 @@ def click_sign_button():
     # 自愈信号：上次定位超时则本次延长到120秒（消费一次即失效）
     LOCATE_WAIT = 120 if self_heal.consume_signal("extend_locate_wait") else 75
     submitted = False
-    while time.time() - t0 < LOCATE_WAIT:
+    # 【2026-09-16 修复·超时虚设】原来全局超时只在"轮与轮之间"检查一次，
+    # 单轮内部没有任何刹车：LOCATE_WAIT(120)+CONFIRM_WAIT(50)+DETAIL_WAIT(20)
+    # 再加轮间 98 秒，最坏能跑到 ~19.5 分钟，而 GLOBAL_TIMEOUT 名义上是 15 分钟。
+    # 把检查直接写进长等待循环条件里（不抽成 lambda，让护栏一眼可见、可被静态断言），
+    # 让 15 分钟真正成为上限。
+    while (time.time() - t0 < LOCATE_WAIT) and (time.time() - T0 < GLOBAL_TIMEOUT):
         h = activate(MINIAPP_TITLE, exact=True)
         if not h:
             time.sleep(1); continue
@@ -2586,7 +2630,9 @@ def click_sign_button():
     tv = time.time(); confirm_rounds = 0; last_refresh = -99; refresh_clicks = 0
     last_back = -99; seen_detail = False; reentered = False
     CONFIRM_WAIT = 50
-    while time.time() - tv < CONFIRM_WAIT:
+    # 同样要受全局超时约束（见 LOCATE_WAIT 处的说明）：确认阶段最长 50 秒，
+    # 若此刻已接近 GLOBAL_TIMEOUT，不能再无条件跑满，否则全局上限失效。
+    while time.time() - tv < CONFIRM_WAIT and (time.time() - T0) < GLOBAL_TIMEOUT:
         h = activate(MINIAPP_TITLE, exact=True)
         if not h:
             time.sleep(1); continue
