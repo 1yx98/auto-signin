@@ -303,6 +303,57 @@ def test_signin_contracts():
     check("防线②补：绿块必须落在窗口内", green_in_window_ok)
 
     # 列表短路必须"宁可漏判也不误判"：拿不到窗口矩形时不许乐观判成功
+    # ★★ 架构红线（2026-09-15）：绝不允许"凭屏幕颜色直接判签到成功"。
+    # 9-15 假成功的根本教训：颜色判定会受壁纸/窗口尺寸/主题/遮挡影响，本质不可靠。
+    # 它可以用来"点按钮"（点错只是重试），但绝不能用来"宣布成功"（判错=静默漏签）。
+    def no_color_success_path():
+        # 1) open_signin_entry() 不能再返回 "already"（那是凭列表颜色判成功的出口）
+        # 用 AST 查真实的 Return 语句，避开注释里提到该字符串的干扰
+        target = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "open_signin_entry":
+                target = n
+                break
+        if target is None:
+            raise AssertionError("找不到 open_signin_entry()")
+        bad_returns = []
+        for sub in ast.walk(target):
+            if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Constant):
+                # 只拦 "already"（凭颜色判成功的信号）。
+                # return True 是合法的"导航成功"，不拦。
+                if sub.value.value == "already":
+                    bad_returns.append("return 'already'")
+        if bad_returns:
+            raise AssertionError(
+                "open_signin_entry() 里出现 %s —— 这是'凭列表颜色直接判签到成功'的假成功路径，"
+                "9-15 已删除。要恢复请先读完那次事故记录：它从未带来收益，却制造了唯一一次假成功。"
+                % ", ".join(bad_returns))
+        return "open_signin_entry 无 'already' 出口"
+    check("架构红线：导航层不得凭颜色判成功", no_color_success_path)
+
+    def color_only_logs():
+        # 2) 调用 first_card_status_green() 的地方，不得把结果用于 return 成功
+        # 用 AST：检查该调用后紧跟的 if 语句是否拿 gok 做分支
+        bad = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.If):
+                # if gok: / if gok and ...
+                t = n.test
+                names = [x.id for x in ast.walk(t) if isinstance(x, ast.Name)]
+                if "gok" in names:
+                    bad.append(n.lineno)
+        if bad:
+            raise AssertionError(
+                "first_card_status_green() 的返回值被用于决策（第 %s 行出现 `if gok:`）！"
+                "颜色判定只允许写日志参考，不得参与'判成功'。" % bad)
+        return "颜色判定仅作参考日志，不参与任何 if 决策"
+    check("架构红线：颜色判定不得参与决策", color_only_logs)
+
+    # 关键护栏仍在：详情页判定 + 重进刷新（这两个才是权威依据）
+    for fn in ("open_signin_entry", "reopen_miniprogram_to_refresh", "click_sign_button"):
+        check("关键函数仍在 %s()" % fn, lambda fn=fn: fn in top_funcs or (_ for _ in ()).throw(
+            AssertionError("找不到 %s()" % fn)))
+
     def conservative_ok():
         m = re.search(r"def first_card_status_green\(.*?\n(?=def )", src, re.S)
         body = m.group(0) if m else ""

@@ -1646,19 +1646,24 @@ def open_signin_entry():
             logger.info(f"[导航] 第{i+1}/{len(NAV_STEPS)}步「{name}」首屏 conf={c:.3f}")
         if c >= CONFIDENCE:
             if topmost:
-                # 列表第一张卡片（当天记录）状态行已是绿色'已签到' → 今日已签/上一轮已签成功，
-                # 直接判定成功、不再进详情页重复签到（列表已签短路）。
+                # 【2026-09-15 架构调整·消灭假成功路径】
+                # 这里原本是"列表已签短路"：看到首卡绿色就 return "already" 直接判成功。
+                # 9-15 那天它误判了一次（ROI 越出窗口扫到桌面壁纸）→ 假成功、推绿卡、实际没签到。
+                #
+                # 复盘结论：**颜色判定不足以作为"宣布成功"的依据**，只能作为参考。
+                # 理由：屏幕像素会受壁纸、窗口尺寸、主题、缩放、遮挡影响，本质不可靠；
+                # 而它唯一的收益只是"今天已签时少走一遍详情页、省 20~30 秒"，
+                # 风险与收益完全不对等（省 30 秒 vs 静默漏签）。
+                # 历史数据：11 次真实运行中，这个短路只触发过 1 次，且就是那次误判 →
+                # **从未带来过收益，却制造了唯一一次假成功。**
+                #
+                # 现在改为：颜色判定**只写日志、不参与决策**，一律点击进入详情页，
+                # 由详情页（能看到签到场次/时间/服务器回执）做权威判定。
+                # 这样做的代价是今日已签时多花约 20~30 秒 —— 用这点时间换掉一整类假成功，值得。
                 h = activate(MINIAPP_TITLE, exact=True)
                 gok, gdesc = first_card_status_green(h, x, y)
-                if gok:
-                    if before_signin_start():
-                        logger.info(f"[导航] 第{i+1}步「{name}」列表第一张绿色'已签到'，但签到未开始——这是昨天的记录，不短路，继续点击进入详情页验证")
-                    else:
-                        logger.info(f"[导航] 第{i+1}步「{name}」列表第一张卡片已是绿色'已签到'（{gdesc}），今日已签，判定成功")
-                        shot(f"nav{i+1}_{name}_列表已签")
-                        return "already"
-                else:
-                    logger.info(f"[导航] 第{i+1}步「{name}」列表第一张未检测到绿色'已签到'（{gdesc}），正常点击进入详情页")
+                logger.info(f"[导航] 第{i+1}步「{name}」首屏列表状态参考：{gdesc}"
+                            f"（仅供参考，不据此判成功，一律进详情页核实）")
                 pyautogui.click(x, y)
                 logger.info(f"[导航] 第{i+1}步「{name}」命中并点击({x},{y})（列表最上=当天记录）")
                 time.sleep(3); shot(f"nav{i+1}_{name}")
@@ -1687,17 +1692,11 @@ def open_signin_entry():
             shot(f"找_{name}_{k}")
             if c >= CONFIDENCE:
                 if topmost:
+                    # 同首屏分支：颜色判定仅作参考日志，不再短路判成功（见上方 2026-09-15 架构调整说明）
                     h = activate(MINIAPP_TITLE, exact=True)
                     gok, gdesc = first_card_status_green(h, x, y)
-                    if gok:
-                        if before_signin_start():
-                            logger.info(f"[导航] 第{i+1}步「{name}」下滚后列表绿色'已签到'，但签到未开始——昨天的记录，不短路，继续点击")
-                        else:
-                            logger.info(f"[导航] 第{i+1}步「{name}」下滚后命中，列表第一张已是绿色'已签到'（{gdesc}），今日已签，判定成功")
-                            shot(f"nav{i+1}_{name}_列表已签")
-                            return "already"
-                    else:
-                        logger.info(f"[导航] 第{i+1}步「{name}」下滚后列表未检测到绿色'已签到'（{gdesc}），正常点击进入")
+                    logger.info(f"[导航] 第{i+1}步「{name}」下滚后列表状态参考：{gdesc}"
+                                f"（仅供参考，不据此判成功，一律进详情页核实）")
                 pyautogui.click(x, y)
                 logger.info(f"[导航] 第{i+1}步「{name}」命中并点击({x},{y})")
                 time.sleep(3); found = True
@@ -2269,12 +2268,10 @@ def attempt_once(rnd, total_rounds):
     # ---- S3 进入签到消息列表 ----
     TRACE.begin_step("S3", "进入签到消息列表")
     _ent = open_signin_entry()
-    if _ent == "already":
-        logger.info("[流程] 签到消息列表第一张卡片已显示绿色'已签到'，今日已签，判定成功")
-        TRACE.end_step("short_circuit", "LIST_ALREADY_SIGNED")
-        TRACE.end_round("success")
-        step_shot(f"{rnd}_3_列表已签")
-        return "success"
+    # 【2026-09-15】原先这里有个 `if _ent == "already": return "success"` 分支——
+    # 那是"列表看到绿色就判成功"的短路出口，9-15 因扫到桌面壁纸而误判过一次。
+    # 该分支已随架构调整一并移除：open_signin_entry() 不再返回 "already"，
+    # 签到结果一律由详情页核对给出，不再有任何"凭颜色直接判成功"的路径。
     if _ent == "not_time":
         logger.info("[流程] 签到未开始（不在时段），返回 not_time")
         TRACE.end_step("not_time", "SIGNIN_NOT_STARTED")
