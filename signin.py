@@ -2096,6 +2096,11 @@ def click_sign_button():
     TRACE.signal("finish_clicks", finish_clicks)
     TRACE.signal("relocate_clicks", relocate_clicks)
     TRACE.signal("wifi_reconnected", wifi_refreshed)
+    # 同步到全局进度（atexit 中断兜底用）：走到这里说明"完成签到"已真实点击
+    try:
+        _GUARD["finish_clicks"] = max(_GUARD["finish_clicks"], finish_clicks)
+    except Exception:
+        pass
     TRACE.end_step("success")
     TRACE.begin_step("S7", "提交后硬确认")
 
@@ -2326,6 +2331,11 @@ def attempt_once(rnd, total_rounds):
 # 一次运行只推一条飞书：异常路径可能重复调用，用这个标记兜住
 _FEISHU_DONE = [False]
 
+# 【2026-09-15】给 atexit 中断兜底用的全局进度标记：
+# click_sign_button() 每点一次"完成签到"就累加，进程被强杀时据此判断
+# "是否值得补一条结果未知的提醒"。用 list 包一层是为了在嵌套函数里能就地改。
+_GUARD = {"finish_clicks": 0, "detail_seen": False}
+
 def _within_signin_window():
     """当前是否还在签到时间窗内（用于决定要不要跑第三轮补救）。
 
@@ -2389,6 +2399,17 @@ def main():
     try:
         for _line in self_heal.preheat():
             logger.info(_line)
+    except Exception:
+        pass
+    # 台账补偿：上次若因 data\signin_history.csv 被 Excel/WPS 打开而没写进去，
+    # 这里补上。不加这一步，台账会长期静默为空（2026-09-15 实测发现）。
+    try:
+        if signin_history is not None:
+            _fd, _fl = signin_history.flush_pending()
+            if _fd or _fl:
+                logger.info(f"[台账] 补写待补队列：成功 {_fd} 条，仍积压 {_fl} 条"
+                            + ("（文件仍被占用，请关闭 Excel/WPS 里的 signin_history.csv）"
+                               if _fl else ""))
     except Exception:
         pass
     logger.info("=" * 58)
@@ -2578,7 +2599,7 @@ def main():
                 logger.info(_hmsg)
         except Exception:
             pass
-        # 台账：把这次的成败写进 data/signin_history.csv（纯新增，失败静默）。
+        # 台账：把这次的成败写进 data/signin_history.csv（纯新增，失败不中断签到）。
         # 要在 finally 里写而不是收尾处写——异常路径（如抛错退出）同样要留痕，
         # 否则"漏签"最容易漏记的恰恰是异常那几次。
         try:
@@ -2588,11 +2609,46 @@ def main():
                     start_ts=T0, end_ts=time.time(),
                     fail_step=_fstep, fail_code=_fcode,
                     run_dir=os.path.basename(RUN_DIR))
-                if _row:
+                _kind = getattr(signin_history, "LAST_ERROR_KIND", None)
+                if _kind == "busy_queued":
+                    # 【2026-09-15】原来这里只判 if _row 就打"已记录"，而文件被 Excel/WPS
+                    # 占用时 append_record 曾静默返回 None，日志里什么都看不到——台账空了几个月
+                    # 都没人发现。现在把"暂存待补"明确说出来，不让人误以为已落盘。
+                    logger.warning("[台账] 主台账被占用，本次记录已暂存待补队列，下次运行自动补写"
+                                   "（请关闭 Excel/WPS 中打开的 data\\signin_history.csv）")
+                elif _row:
                     logger.info("[台账] 已记录：%s %s → %s"
                                 % (_row.get("date"), _row.get("time"), result))
+                else:
+                    logger.warning("[台账] 记录写入失败：%s"
+                                   % getattr(signin_history, "LAST_ERROR", "未知原因"))
+        except Exception as _he2:
+            logger.warning("[台账] 写台账时异常（不影响签到）: %s" % _he2)
+
+if __name__ == "__main__":
+    # 【2026-09-15 修复·中断静默】进程被强杀（Ctrl+C / 关窗口 / taskkill）时，
+    # 原来的实现直接死掉，**不会发任何通知**：
+    # 实测 21:16 那次 —— 签到其实已经成功，却因为闭运算 bug 判了 fail，
+    # 用户在 21:18:53 把脚本掐了 → 收不到任何消息，只能干等。
+    # 这里注册一个兜底：**只有当"本轮已经点过完成签到、但还没走到收尾"时才补发**，
+    # 避免每次正常启动/退出都制造噪音；也避免误报"签到成功"（它只说"结果未知"）。
+    def _on_exit_guard():
+        try:
+            if _FEISHU_DONE[0]:
+                return                      # 已经发过结果通知，不重复
+            if _GUARD.get("finish_clicks", 0) <= 0:
+                return                      # 还没点过签到，中断无信息量，不发
+            feishu_notify and feishu_notify.notify_early_exit(
+                "脚本被中断，且中断前已点击过「完成签到」——本次结果未知，请人工确认是否已签到",
+                detail_lines=["（脚本未跑完收尾就退出了，无法判定成败，故不写 result.txt）"],
+                run_dir=globals().get("RUN_DIR"))
+            logger.warning("[通知] 已发送中断兜底提醒（结果未知）")
         except Exception:
             pass
 
-if __name__ == "__main__":
+    try:
+        import atexit as _atexit
+        _atexit.register(_on_exit_guard)
+    except Exception:
+        pass
     sys.exit(main())

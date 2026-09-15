@@ -18,6 +18,7 @@
     全部通过 → 退出码 0；有失败 → 退出码 1。
 """
 import ast
+import csv
 import json
 import os
 import re
@@ -608,6 +609,72 @@ def test_history():
                 shutil.rmtree(tmpd3, ignore_errors=True)
         check("空台账不崩且描述为空", empty_ok)
 
+        # 【2026-09-15 新增·防线】主台账被 Excel/WPS 占用时，记录绝不能丢。
+        # 真实现场：用户开着 data\signin_history.csv，WinError 32 → 原实现静默 return None
+        # → 台账长期为空 → should_escalate 永远 False → "连续失败告警"从未生效。
+        def busy_fallback_ok():
+            import builtins
+            tmpd4 = tempfile.mkdtemp(prefix="smoke_busy_")
+            real_open = builtins.open
+
+            def fake_open(path, mode="r", *a, **kw):
+                # 只拦截对主台账的「写」操作，模拟被其它程序独占锁定
+                if "a" in mode and os.path.basename(str(path)) == H.HISTORY_FILE:
+                    raise PermissionError(13, "另一个程序正在使用此文件")
+                return real_open(path, mode, *a, **kw)
+
+            try:
+                builtins.open = fake_open
+                r = H.append_record(result="success", code=0, base_dir=tmpd4)
+            finally:
+                builtins.open = real_open
+            if r is None:
+                raise AssertionError("被占用时应返回行数据（已暂存队列），实际 None")
+            if getattr(H, "LAST_ERROR_KIND", None) != "busy_queued":
+                raise AssertionError("LAST_ERROR_KIND 应为 busy_queued，实际 %r"
+                                     % getattr(H, "LAST_ERROR_KIND", None))
+            pend = os.path.join(tmpd4, H.HISTORY_DIR, H.PENDING_FILE)
+            if not os.path.isfile(pend):
+                raise AssertionError("待补队列没生成，记录真的丢了")
+            with real_open(pend, encoding="utf-8-sig", newline="") as f:
+                rows = [x for x in csv.DictReader(f) if x.get("date")]
+            if len(rows) != 1:
+                raise AssertionError("待补队列应有 1 行，实际 %d 行" % len(rows))
+            shutil.rmtree(tmpd4, ignore_errors=True)
+            return "占用时暂存待补队列，未丢记录"
+
+        check("台账被占用不丢记录（补偿队列）", busy_fallback_ok)
+
+        # 补写回路：占用解除后 flush_pending 要能把积压补回主台账
+        def flush_ok():
+            tmpd5 = tempfile.mkdtemp(prefix="smoke_flush_")
+            import builtins
+            real_open = builtins.open
+
+            def fake_open(path, mode="r", *a, **kw):
+                if "a" in mode and os.path.basename(str(path)) == H.HISTORY_FILE:
+                    raise PermissionError(13, "另一个程序正在使用此文件")
+                return real_open(path, mode, *a, **kw)
+
+            try:
+                builtins.open = fake_open
+                H.append_record(result="fail", code=1, base_dir=tmpd5)
+            finally:
+                builtins.open = real_open
+            done, left = H.flush_pending(base_dir=tmpd5)
+            if done != 1 or left != 0:
+                raise AssertionError("补写应为 (1,0)，实际 (%d,%d)" % (done, left))
+            rows = H.recent_records(9999, base_dir=tmpd5)
+            if len(rows) != 1 or rows[0]["result"] != "fail":
+                raise AssertionError("补写后主台账读不到那条记录")
+            pend = os.path.join(tmpd5, H.HISTORY_DIR, H.PENDING_FILE)
+            if os.path.isfile(pend):
+                raise AssertionError("补写成功后队列文件应被清掉")
+            shutil.rmtree(tmpd5, ignore_errors=True)
+            return "占用解除后自动补写并清空队列"
+
+        check("台账补偿队列可回填", flush_ok)
+
     finally:
         shutil.rmtree(tmpd, ignore_errors=True)
 
@@ -659,6 +726,38 @@ def test_notify():
             raise AssertionError("notify_signin_result 缺 dry_run 参数，冒烟测试无法离线验证")
         return "支持 dry_run"
     check("通知支持 dry_run（可离线验证）", dryrun_ok)
+
+    # 【2026-09-15 新增·防线】脚本被强杀时必须补一条"结果未知"提醒。
+    # 真实现场：21:16 那次签到其实已成功，判 fail 后用户在 21:18:53 掐掉脚本
+    # → notify_feishu 从未调用 → 一条消息都没有，只能干等。
+    # 断言两件事：①有 atexit 兜底钩子 ②钩子有"未点过签到就不发"的降噪条件。
+    def kill_guard_ok():
+        import inspect
+        src = open(os.path.join(HERE, "signin.py"), encoding="utf-8").read()
+        if "atexit" not in src:
+            raise AssertionError("signin.py 没有 atexit 兜底：被强杀时不会发任何通知")
+        if "_on_exit_guard" not in src:
+            raise AssertionError("找不到 _on_exit_guard 中断兜底函数")
+        if "_FEISHU_DONE[0]" not in src.split("_on_exit_guard", 1)[1][:900]:
+            raise AssertionError("中断兜底没有复用 _FEISHU_DONE：正常退出时会重复推送")
+        if 'finish_clicks", 0) <= 0' not in src and "finish_clicks\", 0) <= 0" not in src:
+            raise AssertionError("中断兜底缺降噪条件：每当中断都发会变成噪音")
+        return "有中断兜底 + 降噪条件"
+    check("被强杀时会补发结果未知提醒", kill_guard_ok)
+
+    # 台账写入失败必须在 run.log 可见（原来是纯 pass，空了几个月没人发现）
+    def ledger_visible_ok():
+        src = open(os.path.join(HERE, "signin.py"), encoding="utf-8").read()
+        seg = src.split("signin_history.append_record", 1)
+        if len(seg) < 2:
+            raise AssertionError("找不到 append_record 调用点")
+        tail = seg[1][:1800]
+        if "busy_queued" not in tail:
+            raise AssertionError("台账写入没区分'暂存待补'：被占用时日志仍看不出问题")
+        if "记录写入失败" not in tail:
+            raise AssertionError("台账彻底写入失败时没有 WARNING，仍会静默")
+        return "占用/失败都写日志"
+    check("台账写入失败在日志可见", ledger_visible_ok)
 
 
 # =========================================================
