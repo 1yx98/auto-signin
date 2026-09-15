@@ -49,6 +49,10 @@
 - 台账写入失败只打一条 warning，**绝不影响签到主流程**。
 - `data/` 已在 `.gitignore` 中排除，不会随项目上传。
 
+**看统计**：双击 **`看签到统计.bat`**（或跑 `runtime\python.exe report.py`），
+会打印出勤概览：成功/失败天数、成功率、当前连续状态、**具体哪几天漏了**、耗时统计。
+只看不写，不会改动台账。想换范围加天数参数，如 `report.py 7`（最近 7 天）、`report.py 999`（全部）。
+
 ### 失败现场保留更久（logs/run_*）
 
 每次运行都会建一个 `logs/run_YYYYMMDD_HHMMSS/`（含 `run.log` + 当次全部截图）。
@@ -106,7 +110,7 @@ runtime\python.exe smoke_test.py
 ```
 
 **它不碰微信**——不控制鼠标键盘、不抓屏、不发网络请求、不改任何真实数据，
-几秒钟跑完 60 多项检查，告诉你有没有把东西改坏。改代码之后想快速确认，
+几秒跑完 80 项检查，告诉你有没有把东西改坏。改代码之后想快速确认，
 先跑这个，比真跑一次签到（3~5 分钟 + 必须开微信）省事得多。
 
 它检查的内容：
@@ -191,7 +195,8 @@ runtime\python.exe smoke_test.py
 | `3_安装定时任务(管理员).bat` + `install_task.ps1` | 一键安装最高权限定时任务 |
 | `1_采集模板.bat` + `capture_templates.py` | 采集模板（换机器后必须先跑一次）|
 | `history.py` | 签到台账：每次运行追加一行到 `data/signin_history.csv`，用来回答"这学期漏了几次" |
-| `smoke_test.py` | **冒烟测试（离线自检）**：`runtime\python.exe smoke_test.py`，不碰微信、几秒跑完 60+ 项检查，改完代码先跑它 |
+| `report.py` + `看签到统计.bat` | **出勤报表（只读）**：打印成功/失败天数、成功率、连续状态、具体哪天漏了 |
+| `smoke_test.py` | **冒烟测试（离线自检）**：`runtime\python.exe smoke_test.py`，不碰微信、几秒跑完 80 项检查，改完代码先跑它 |
 | `collect_samples.py` + `采集样本.bat` | 界面样本采集工具（**只截图、不操作微信**）：把当前屏幕存进 `logs/samples/` 并打标签，用于日后评估 OCR 方案或排查模板问题 |
 | `self_heal.py` / `step_tracer.py` | 自愈预热、步骤轨迹（纯观察，不影响签到） |
 | `notify_helper/` | 飞书通知（成功发、失败也发，卡片附近 7 天统计） |

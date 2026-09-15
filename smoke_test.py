@@ -71,6 +71,7 @@ def test_files_exist():
     required = [
         "signin.py", "history.py", "import_history.py", "collect_samples.py",
         "self_heal.py", "step_tracer.py", "capture_templates.py",
+        "report.py", "smoke_test.py",
         "config.json", "config.example.json", "README.md",
         "run_signin_task.bat", "run_signin.bat",
         "notify_helper/feishu_notify.py", "notify_helper/notify_config.json",
@@ -82,7 +83,7 @@ def test_files_exist():
 def test_python_syntax():
     section("语法检查")
     for f in ("signin.py", "history.py", "import_history.py", "collect_samples.py",
-              "self_heal.py", "step_tracer.py", "notify_helper/feishu_notify.py"):
+              "self_heal.py", "step_tracer.py", "report.py", "notify_helper/feishu_notify.py"):
         p = os.path.join(HERE, f)
         if not os.path.isfile(p):
             bad("语法 " + f, "文件不存在")
@@ -319,6 +320,34 @@ def test_run_outcome():
             shutil.rmtree(d, ignore_errors=True)
 
 
+def test_report_readonly():
+    section("报表工具 report.py")
+    p = os.path.join(HERE, "report.py")
+    if not os.path.isfile(p):
+        bad("report.py 存在", "文件缺失")
+        return
+    ok("report.py 存在")
+
+    # 必须只读：源码里不能出现写台账/删除的动作
+    def readonly_ok():
+        with open(p, encoding="utf-8") as f:
+            src = f.read()
+        risky = []
+        for pat, why in (("append_record", "会写台账"), ("os.remove", "会删文件"),
+                         ("shutil.rmtree", "会删目录")):
+            if pat in src:
+                risky.append("%s（%s）" % (pat, why))
+        # 只允许以读模式打开文件
+        for m in re.finditer(r"open\([^)]*\)", src):
+            call = m.group(0)
+            if not re.search(r"[\"'](r|rb)[\"']", call):
+                risky.append("非只读 open: %s" % call.replace("\n", " "))
+        if risky:
+            raise AssertionError("report.py 应只读，但出现: %s" % risky)
+        return "只读，无写入/删除动作"
+    check("report.py 只读", readonly_ok)
+
+
 def test_bat_ascii():
     section("bat 文件安全性")
     # 任务计划用的 bat 必须纯 ASCII，否则可能 LastTaskResult=9009/2
@@ -520,6 +549,7 @@ def main():
     test_templates_exist()
     test_signin_contracts()
     test_run_outcome()
+    test_report_readonly()
     test_bat_ascii()
     test_history()
     test_notify()
