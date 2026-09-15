@@ -100,6 +100,10 @@ SEARCH_KEYWORD = CONFIG.get("search_keyword", "油学通")
 MINIAPP_TITLE = CONFIG.get("miniprogram_title", "油学通")   # 小程序独立窗口标题（用作窗口查找/置顶关键词）
 SIGNIN_TIME_START = CONFIG.get("signin_time_start", "20:50")  # 签到开放时间（仅提示用，不硬卡）
 SIGNIN_TIME_END = CONFIG.get("signin_time_end", "21:30")      # 签到结束时间（仅提示用，不硬卡）
+# 【2026-09-15】按钮文字 OCR 复核开关（第三路判据，仅行使否决权，见 ocr_veto_signed）。
+# 默认开启：它只在"准备判成功"时复核一次，约 45ms，且读不到就放行，风险极低。
+# 如果你想彻底关掉（比如在没装中文 OCR 的机器上想省掉初始化日志），改这里或 config.json。
+OCR_VERIFY_ENABLED = CONFIG.get("ocr_verify", True)
 
 def before_signin_start():
     """当前时间是否在签到开放时间之前。
@@ -1717,8 +1721,9 @@ def open_signin_entry():
             # 此时应视为已到达签到详情页（确认阶段会识别"已签到"并判成功），而不是导航失败。
             hh = activate(MINIAPP_TITLE, exact=True)
             if hh:
-                _btns = scan_buttons(hh)
-                if signed_detail_button(hh, _btns):
+                _cap = []
+                _btns = scan_buttons(hh, grab_full=_cap)
+                if signed_detail_button(hh, _btns, full=(_cap[0] if _cap else None)):
                     # 时间守卫：签到开始前检测到灰色'已签到'，极可能是昨天的记录
                     if before_signin_start():
                         logger.info(f"[导航] 第{i+1}步「{name}」未找到'进入按钮'，但检测到灰色'已签到'——签到未开始，这是昨天的记录，返回 not_time")
@@ -1741,7 +1746,174 @@ def open_signin_entry():
     logger.info("[导航] 已按顺序走完所有入口，到达签到详情页")
     return True
 
-def scan_buttons(hwnd, y_frac=0.46):
+# ============================================================================
+# 【2026-09-15 新增·第三路判据】按钮文字 OCR（Windows 内置，零额外体积依赖）
+# ----------------------------------------------------------------------------
+# 背景：用户在 2026-09-15 实测指出一个**纯几何/字迹判据永远无法解决**的问题——
+#   「已签到」和「已结束」是同款灰宽按钮，像素形态几乎完全相同
+#   （实测：墨迹 0.5580 vs 0.5522，宽高比都是 1.01）。
+#   唯一能区分的手段是**读文字**或**靠时间推理**。时间推理已实现（双时间守卫），
+#   但它在"页面停在昨天那条已结束记录"时只能靠时段排除，一旦时段判断有偏差就会假成功。
+#
+# 实测结论（2026-09-15，真实截图 + 合成对照）：
+#   ✅ 引擎：Windows 自带 OCR（C:/Windows/OCR/zh-cn），语言 zh-Hans-CN 可用
+#   ✅ 依赖：winrt-* 分体式轮子（纯二进制，无需编译器），装进便携 runtime 后仍"拷走即用"
+#   ✅ 「已签到」在 **4x 放大** 下稳定读出；2x/3x 读不到，5x 会退化成「已签至刂」，4x 最稳
+#   ✅ 「不在区域内」在 2x~6x 全部稳定读出
+#   ✅ **关键**：「已结束」在 3x~8x 全程**从不**被误读成「已签到」（合成对照 6 档全对）
+#   ✅ 耗时：单次约 45ms（均值），最大约 123ms —— 相对"跑一轮几十秒"可忽略
+#
+# 【安全设计：仅否决权（veto-only）】
+#   OCR 只在一件事上有发言权——**推翻"已签到"判定**。
+#   它绝不会主动宣布成功，因为：
+#     1) 它认错字的方向是不利的（把已结束认成已签到 = 假成功 = 最坏结果）；
+#     2) 只给它否决权，则它认错最多导致"多跑一轮"（可恢复），而不是"假成功"（不可恢复）。
+#   具体规则在 ocr_veto_signed() 里，三条铁律：
+#     · 读到「已结束」等否定词 → 否决（返回 False）
+#     · 读到「已签到」→ 允许通过（返回 True）
+#     · **读不到 / 引擎不可用 / 任何异常 → 放行**（返回 None，不否决）
+#       —— 因为"读不到"是常态（字体/缩放/主题变化），若把读不到当否决，
+#          会让脚本在最需要它工作的时候集体摆烂，这比误读更常见、危害更大。
+# ============================================================================
+
+_OCR_ENGINE = None
+_OCR_FAILED = False      # 引擎初始化失败后置位，后续不再重试（避免每轮白等）
+_OCR_STATS = {"calls": 0, "veto": 0, "pass": 0, "unknown": 0}
+
+# 出现这些词 → 明确不是"今天已签到"（历史记录 / 未开放）
+_OCR_NEGATIVE = ("已结束", "已过期", "未开始", "不在区域内", "未在区域", "签到未开始")
+# 读到其中任意一个 → 认为"这一档放大倍数读到了有用的东西"，可早退（不必再试下一档）
+_OCR_KEYWORDS = ("签到", "结束", "区域", "开始", "已签")
+
+def _ocr_get_engine():
+    """惰性初始化 Windows 内置 OCR 引擎。不可用时返回 None 并记住失败。"""
+    global _OCR_ENGINE, _OCR_FAILED
+    if _OCR_ENGINE is not None:
+        return _OCR_ENGINE
+    if _OCR_FAILED:
+        return None
+    try:
+        from winrt.windows.media.ocr import OcrEngine
+        from winrt.windows.globalization import Language
+        eng = OcrEngine.try_create_from_language(Language("zh-CN"))
+        if eng is None:
+            eng = OcrEngine.try_create_from_user_profile_languages()
+        if eng is None:
+            raise RuntimeError("系统没有可用的中文 OCR 语言包（需在'语言设置'里添加中文）")
+        _OCR_ENGINE = eng
+        logger.info("[OCR] Windows 内置中文 OCR 引擎就绪（零额外依赖）")
+        return eng
+    except Exception as e:
+        _OCR_FAILED = True
+        logger.warning(f"[OCR] 引擎不可用，本轮及后续将自动跳过 OCR 复核（不影响其他判据）：{e}")
+        return None
+
+
+def _ocr_read(engine, bgr):
+    """对一张 BGR 图做 OCR，返回去掉空格的文字（失败返回 ""）。"""
+    import asyncio
+    from winrt.windows.graphics.imaging import BitmapDecoder
+    from winrt.windows.storage.streams import DataWriter, InMemoryRandomAccessStream
+
+    async def _go():
+        ok, buf = cv2.imencode(".png", bgr)
+        if not ok:
+            return ""
+        stream = InMemoryRandomAccessStream()
+        w = DataWriter(stream)
+        w.write_bytes(buf.tobytes())
+        await w.store_async()
+        await w.flush_async()
+        stream.seek(0)
+        dec = await BitmapDecoder.create_async(stream)
+        res = await engine.recognize_async(await dec.get_software_bitmap_async())
+        return "".join(l.text for l in res.lines).replace(" ", "")
+
+    return asyncio.run(_go())
+
+
+def ocr_button_text(full, btn, scales=(4, 3, 6, 5, 8)):
+    """裁出按钮→放大→OCR，返回读到的文字（读不到返回 ""）。
+
+    【为什么要试多个倍数】实测（2026-09-15）各词的"最佳倍数"并不一致：
+        已签到    3x空   4x已签至刂  5x已签到   6x已签到   8x已签到
+        已结束    3x空   4x已结束    5x已结束   6x已结束   8x已结束
+        不在区域内 3x~8x 全部稳定
+    也就是说**单靠一个倍数会漏读**。这里按 4x→3x→6x→5x→8x 依次尝试，
+    只要某一档读到了"我们关心的关键词"就立刻返回（早退，省时间）。
+    最坏情况（全读不到）才会跑满 5 档，约 200ms —— 只在准备判成功时发生一次，可接受。
+
+    4x 排第一是因为它在实测里对「已签到」表现最好（5x 会退化成「已签至刂」）。
+    """
+    eng = _ocr_get_engine()
+    if eng is None or full is None or not btn:
+        return ""
+    try:
+        H, W = full.shape[:2]
+        # 用按钮自身坐标裁（scan_buttons 已把 x/y 带回来了），留一点点内边距避开描边
+        x0 = max(0, btn["x"] - 4); y0 = max(0, btn["y"] - 4)
+        x1 = min(W, btn["x"] + btn["w"] + 4); y1 = min(H, btn["y"] + btn["h"] + 4)
+        if x1 - x0 < 20 or y1 - y0 < 10:
+            return ""
+        crop = full[y0:y1, x0:x1]
+        best = ""
+        for s in scales:
+            big = cv2.resize(crop, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+            txt = _ocr_read(eng, big)
+            if txt and any(k in txt for k in _OCR_KEYWORDS):
+                return txt          # 读到关键词就收工
+            if txt and not best:
+                best = txt
+        return best
+    except Exception as e:
+        logger.debug(f"[OCR] 单次识别失败（不否决，按'未知'处理）：{e}")
+        return ""
+
+
+def ocr_veto_signed(full, btn, tag=""):
+    """OCR 复核：仅对"已签到"判定行使**否决权**。
+
+    返回：
+      False —— 明确读到否定词（已结束/不在区域内/未开始…）→ **否决**"已签到"判定
+      True  —— 明确读到「已签到」→ 放行，且这是很强的正向证据
+      None  —— 读不到 / 引擎不可用 / 任何异常 → **不否决**（放行，退回其他判据）
+    """
+    global _OCR_STATS
+    if not OCR_VERIFY_ENABLED:
+        return None
+    eng = _ocr_get_engine()
+    if eng is None:
+        return None
+    try:
+        _OCR_STATS["calls"] += 1
+        txt = ocr_button_text(full, btn)
+        if not txt:
+            _OCR_STATS["unknown"] += 1
+            logger.info(f"[OCR] {tag}按钮文字读不出（不否决，交给其他判据）")
+            return None
+        # 1) 否定词优先（安全方向：宁可判否）
+        for w in _OCR_NEGATIVE:
+            if w in txt:
+                _OCR_STATS["veto"] += 1
+                logger.warning(f"[OCR] {tag}按钮文字=「{txt}」含否定词「{w}」→ **否决**'已签到'判定"
+                               f"（这是防假成功的关键一步）")
+                return False
+        # 2) 正向词
+        if "已签到" in txt or "已签 到" in txt or "已签至刂" in txt:
+            _OCR_STATS["pass"] += 1
+            logger.info(f"[OCR] {tag}按钮文字=「{txt}」确认为「已签到」（正向证据）")
+            return True
+        # 3) 读到了字但不是我们认识的词 → 保守：不否决，但要留痕
+        _OCR_STATS["unknown"] += 1
+        logger.warning(f"[OCR] {tag}按钮读到「{txt}」但不是预期的词，不否决（请人工留意）")
+        return None
+    except Exception as e:
+        _OCR_STATS["unknown"] += 1
+        logger.warning(f"[OCR] 复核异常（不否决）：{e}")
+        return None
+
+
+def scan_buttons(hwnd, y_frac=0.46, grab_full=None):
     """在 油学通 窗口【下半部】扫描宽扁纯色按钮，返回 list[dict(kind,cx,cy,w,h,fill)]。
     kind=blue(蓝色'签到')/green('请假'或地图页'完成签到')/gray('已签到'或定位中/'不在区域内')。
     只看下半部，彻底排除顶部同色蓝色标题栏被误判成按钮。DEBUG 日志记录每个色块落选原因。"""
@@ -1797,11 +1969,16 @@ def scan_buttons(hwnd, y_frac=0.46):
             if touch_both:
                 rej.append("%dx%d(横跨贴左右边)" % (w, h)); continue
             out.append(dict(kind=kind, cx=x1 + x + w // 2, cy=y1 + y + h // 2,
-                            w=w, h=h, fill=round(fill, 3)))
+                            x=x1 + x, y=y1 + y, w=w, h=h, fill=round(fill, 3)))
         logger.debug("[扫描] %s色: 原始轮廓%d个, 落选=%s" % (kind, len(cnts), rej if rej else "无"))
     desc = ["%s@(%d,%d)%dx%d填充%.2f" % (o["kind"], o["cx"], o["cy"], o["w"], o["h"], o["fill"]) for o in out]
     logger.debug("[扫描] 窗口rect=(%d,%d,%d,%d) 扫描区x[%d,%d]y[%d,%d] min_w=%d 识别=%s"
                  % (l, t, r, b, x1, x2, y1, y2, min_w, desc if desc else "空"))
+    # 【2026-09-15】可选：把这一帧截图一并带回去。
+    # 目的：后面的"字迹校验"需要原始像素，若在别处重新截图会多花 100~300ms，
+    # 而且两次截图之间界面可能变化，导致判据与判断用的不是同一帧。
+    if grab_full is not None:
+        grab_full.append(full)
     return out
 
 def _pick(btns, kind):
@@ -1890,11 +2067,97 @@ def tap_detail_refresh(hwnd):
     cy = t + int((b - t) * 0.374)
     pyautogui.click(int(cx), int(cy))
 
-def signed_detail_button(hwnd, btns):
-    """判断当前是否为'已签到'详情页（签到成功的硬依据）：
-    无蓝色'签到'、无绿色'请假'，且在详情页按钮行存在一个足够宽的灰色按钮。
-    已签灰按钮位于窗口约 0.64~0.80 高度；地图页'不在区域内'灰按钮在约 0.83 高度，据此区分。
-    返回该灰色按钮 dict；不是已签详情页则返回 None。"""
+def button_stylometry(full, btn):
+    """【2026-09-15 新增】按钮"字迹风格"画像——不看整体颜色，看按钮里面的字长什么样。
+
+    为什么需要它：`signed_detail_button()` 原来只靠"灰色块 + 够宽 + 纵向位置"三项几何特征，
+    这在换主题/缩放/微信改版时都可能失效。本函数不依赖绝对颜色，而是测量按钮内部
+    「底色 vs 文字」的关系（底色多亮、对比多强、墨迹占多少、文字是比底色亮还是暗）。
+
+    实测（2026-09-15，全部来自真实截图）：
+      · 「已签到」按钮  : 底色≈204 对比≈28  墨迹≈0.0246 文字比底色**亮**
+      · 「完成签到」按钮: 底色≈136 对比≈117 墨迹≈0.048  文字比底色亮
+      · 地图页灰按钮    : 底色≈247 对比≈47  墨迹≈0.037  文字比底色**暗**
+      · 微信标题栏      : 底色≈123 对比≈120 墨迹≈0.031
+    四者在「底色」这一维上就分得很开（204 / 136 / 247 / 123），配合极性可稳定区分。
+
+    返回 dict（含 bg/contrast/ink/pol 等）；传进来的按钮过小或算不出时返回 None。
+    """
+    try:
+        x, y, w, h = int(btn["x"]), int(btn["y"]), int(btn["w"]), int(btn["h"])
+        if w < 20 or h < 10:
+            return None
+        crop = full[y:y + h, x:x + w]
+        if crop is None or crop.size == 0:
+            return None
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype("float32")
+        H, W = gray.shape[:2]
+        # 取中心区：避开按钮的圆角与描边（那些是按钮"外壳"，不是字）
+        core = gray[int(H * 0.18):int(H * 0.82), int(W * 0.03):int(W * 0.97)]
+        if core.size < 100:
+            return None
+        bg = float(np.median(core))                        # 底色=中位数（抗文字干扰）
+        lo = float(np.percentile(core, 2))
+        hi = float(np.percentile(core, 98))
+        d_lo, d_hi = bg - lo, hi - bg
+        # 文字在底色的哪一侧？偏得更多的那一侧就是字
+        if d_hi >= d_lo:
+            pol, textv = "亮", hi
+        else:
+            pol, textv = "暗", lo
+        contrast = abs(textv - bg)
+        thr = max(4.0, contrast * 0.35)
+        if pol == "亮":
+            ink = float((core > bg + thr).mean())
+        else:
+            ink = float((core < bg - thr).mean())
+        return dict(bg=bg, textv=textv, contrast=contrast,
+                    ink=ink, pol=pol, w=w, h=h)
+    except Exception:
+        return None
+
+
+def is_already_signed_style(st):
+    """【2026-09-15 新增】判断一个按钮的"字迹画像"是否符合「已签到」按钮。
+
+    这是**新增的第二路判据**，与原来的几何判据并行；两者都满足才更可信，
+    但任一路单独成立也足以支持判定（见 signed_detail_button 的取舍说明）。
+
+    判据区间来自实测（见 button_stylometry 注释）。区间刻意留了余量：
+      · 底色 [192, 218]：实测 204，离地图页灰按钮(247)与完成签到(136)都很远
+      · 对比 [18, 55]：实测 28，离完成签到(117)很远
+      · 墨迹 [0.010, 0.042]：实测 0.0246
+      · 必须是"亮字"（白字浅灰底），这是「已签到」最鲜明的特征
+    返回 (是否匹配, 说明字符串)。
+    """
+    if not st:
+        return False, "画不出字迹（按钮过小）"
+    desc = "底色%.0f/对比%.0f/墨迹%.4f/%s字" % (
+        st["bg"], st["contrast"], st["ink"], st["pol"])
+    if st["pol"] != "亮":
+        return False, "非'白字浅底'形态(%s)" % desc
+    if not (192 <= st["bg"] <= 218):
+        return False, "底色不在已签到区间(%s)" % desc
+    if not (18 <= st["contrast"] <= 55):
+        return False, "文字对比度不在已签到区间(%s)" % desc
+    if not (0.010 <= st["ink"] <= 0.042):
+        return False, "文字墨迹占比不在已签到区间(%s)" % desc
+    return True, "字迹符合「已签到」(%s)" % desc
+
+
+def signed_detail_button(hwnd, btns, full=None, verify=True):
+    """判断当前是否为'已签到'详情页（签到成功的硬依据）。
+
+    【2026-09-15 改造：三路判据 + 交集】
+    第一路「几何判据」：无蓝无绿 + 灰色块够宽 + 纵向位置在 0.64~0.80（原有，保留）
+    第二路「字迹判据」：按钮内部"底色/对比/墨迹/极性"是否符合「已签到」形态
+    第三路「文字判据」：OCR 读按钮上的字，**只行使否决权**（见 ocr_veto_signed）
+        —— 这一路是「已签到」vs「已结束」唯一可靠的区分手段，因为两者像素形态相同。
+
+    verify=False 可跳过第二/三路（仅用于性能敏感或明确不需要的场合）。
+
+    返回该灰色按钮 dict；不是已签详情页则返回 None。
+    """
     kinds = [x["kind"] for x in btns]
     if "blue" in kinds or "green" in kinds:   # 详情页未签是 蓝签到+绿请假；已签两者都消失
         return None
@@ -1903,8 +2166,31 @@ def signed_detail_button(hwnd, btns):
         if x["kind"] != "gray":
             continue
         yf = (x["cy"] - t) / H
-        if 0.64 <= yf <= 0.80 and x["w"] >= (r - l) * 0.6:
-            return x
+        # ---- 第一路：几何判据（原有逻辑，保持不变）----
+        if not (0.64 <= yf <= 0.80 and x["w"] >= (r - l) * 0.6):
+            continue
+        # ---- 第二路：字迹判据（新增，仅当拿得到截图时才做）----
+        if verify and full is not None:
+            st = button_stylometry(full, x)
+            ok, desc = is_already_signed_style(st)
+            if not ok:
+                # 两路相矛盾时**判否**（宁可多跑一轮核实，也不要假成功）
+                logger.warning(f"[已签到判据] 几何像但字迹不像，不判成功：{desc} | 灰块{x['w']}x{x['h']}")
+                continue
+            logger.info(f"[已签到判据] 几何 + 字迹双路一致 → {desc}")
+        # ---- 第三路：文字判据（OCR，仅否决权）----
+        # 为什么放在第二路之后：字迹不符的直接 continue 了，OCR 更贵（45ms），
+        # 只在这两路都通过、"马上要判成功"时才做最后一次复核——花的最少，拦得最准。
+        if verify and full is not None:
+            _v = ocr_veto_signed(full, x, tag="详情页")
+            if _v is False:
+                # 读到「已结束」等否定词 → 推翻判定。这正是我们要防的假成功。
+                logger.warning("[已签到判据] OCR 读到否定词，**推翻**'已签到'判定"
+                               "（几何+字迹都像，只有文字能分辨，故必须听它的）")
+                continue
+            if _v is True:
+                logger.info("[已签到判据] 三路一致（几何 + 字迹 + OCR 文字）→ 证据充分")
+        return x
     return None
 
 def reopen_miniprogram_to_refresh():
@@ -1954,15 +2240,18 @@ def click_sign_button():
     t0 = time.time()
     while time.time() - t0 < DETAIL_WAIT:
         h = activate(MINIAPP_TITLE, exact=True)
-        btns = scan_buttons(h) if h else []
+        _cap = []
+        btns = scan_buttons(h, grab_full=_cap) if h else []
         blue, green, gray = _pick(btns, "blue"), _pick(btns, "green"), _pick(btns, "gray")
         logger.info(f"[详情页] 按钮={[(x['kind'], x['cx'], x['cy']) for x in btns]}")
         if blue or green:
+            _cap_last = _cap
             break
+        _cap_last = _cap
         time.sleep(1.2)
     shot("详情页按钮扫描")
     if not blue:
-        if signed_detail_button(h, btns):
+        if signed_detail_button(h, btns, full=(_cap_last[0] if _cap_last else None)):
             # 时间守卫：签到开始前(20:50前)检测到灰色'已签到'，极可能是昨天的记录，不能判今天成功
             if before_signin_start():
                 logger.warning("[详情页] 签到未开始但检测到灰色'已签到'——这是昨天的记录，不是今天，返回 not_time")
@@ -2115,9 +2404,10 @@ def click_sign_button():
         h = activate(MINIAPP_TITLE, exact=True)
         if not h:
             time.sleep(1); continue
-        btns = scan_buttons(h)
+        _cap = []
+        btns = scan_buttons(h, grab_full=_cap)
         has_blue = _pick(btns, "blue") is not None
-        sb = signed_detail_button(h, btns)
+        sb = signed_detail_button(h, btns, full=(_cap[0] if _cap else None))
         if has_blue or sb:
             seen_detail = True     # 已回到详情页（未签旧缓存=有蓝；已签=有灰已签到）
         logger.info(f"[确认] {time.time()-tv:4.1f}s 按钮={[(x['kind'], x['cx'], x['cy']) for x in btns]} "

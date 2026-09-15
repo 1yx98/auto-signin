@@ -43,6 +43,7 @@
   "keep_fail_days": 90,
   "screenshot_on_error": true,
   "screenshot_jpeg_quality": 75,
+  "ocr_verify": true,
   "wifi_ssid": "XSYU_WLAN",
   "wifi_username": "你的校园网账号（学号）",
   "wifi_password": "你的校园网密码"

@@ -349,6 +349,138 @@ def test_signin_contracts():
         return "颜色判定仅作参考日志，不参与任何 if 决策"
     check("架构红线：颜色判定不得参与决策", color_only_logs)
 
+    # 【2026-09-15 新增】双路判据：颜色几何(第一路) + 字迹风格(第二路)，取交集。
+    # 用户要求"保留看颜色的，也当一个路径" —— 所以颜色判据必须**仍然存在**，
+    # 不能为了加新路就把老路删掉（老路是召回，新路是精度，删任一路都会退化）。
+    def dual_path_exist():
+        missing = [fn for fn in ("button_stylometry", "is_already_signed_style")
+                   if fn not in top_funcs]
+        if missing:
+            raise AssertionError(
+                "缺少字迹判据函数 %s —— 第二路判据被删了？"
+                "「已签到」与「已结束」颜色相同，只有字迹风格能把它们和'未签到'灰按钮分开。"
+                % missing)
+        return "字迹判据函数齐全（button_stylometry / is_already_signed_style）"
+    check("双路判据：字迹风格判据存在", dual_path_exist)
+
+    def color_path_kept():
+        """第一路（几何/颜色路径）必须还在 signed_detail_button() 里，不得被新路替换。"""
+        m = re.search(r"def signed_detail_button\((.*?)(?=\ndef )", src, re.S)
+        body = m.group(1) if m else ""
+        if not body:
+            raise AssertionError("找不到 signed_detail_button()")
+        if "0.64 <= yf <= 0.80" not in body:
+            raise AssertionError(
+                "signed_detail_button() 里的几何判据（yf 区间）不在了！"
+                "颜色/几何是第一路，字迹是第二路，两路必须同时存在。")
+        if 'x["w"] >= (r - l) * 0.6' not in body:
+            raise AssertionError("signed_detail_button() 里的宽度判据不在了！颜色路径被削弱。")
+        return "颜色/几何判据（第一路）仍在"
+    check("双路判据：颜色路径未被新路替换", color_path_kept)
+
+    def style_intersect():
+        """两路必须是**取交集**（字迹不像就判否），而不是'任一路过就过'。"""
+        m = re.search(r"def signed_detail_button\((.*?)(?=\ndef )", src, re.S)
+        body = m.group(1) if m else ""
+        if "is_already_signed_style" not in body:
+            raise AssertionError(
+                "signed_detail_button() 没有调用字迹判据 —— 第二路没接上，形同虚设。")
+        if "continue" not in body:
+            raise AssertionError(
+                "字迹判据不通过时没有 continue（判否）—— 两路必须取交集。"
+                "若是'任一路过就判成功'，等于放宽了判据，会引入假成功。")
+        return "几何 + 字迹双路取交集（字迹不像即判否）"
+    check("双路判据：两路取交集而非取并集", style_intersect)
+
+    def style_ranges_sane():
+        """字迹判据区间必须与实测样本一致（防止有人凭感觉放宽到失去区分力）。"""
+        # 实测（2026-09-15，真实截图）：
+        #   「已签到」底色≈204 对比≈28 墨迹≈0.0246 亮字
+        #   地图页灰按钮(未签到) 底色≈247 对比≈47 墨迹≈0.037 暗字
+        #   任务栏灰块 底色≈217 对比≈191 暗字
+        m = re.search(r"def is_already_signed_style\((.*?)(?=\ndef )", src, re.S)
+        body = m.group(1) if m else ""
+        if not body:
+            raise AssertionError("找不到 is_already_signed_style()")
+        if '"亮"' not in body:
+            raise AssertionError(
+                "字迹判据没有校验极性（亮字/暗字）！"
+                "这是区分「已签到」(白字浅灰底) 与地图页灰按钮(暗字) 的**关键特征**，"
+                "少了它判据会同时接受两类按钮 → 假成功。")
+        for lo, hi, name in (("192", "218", "底色"),
+                             ("18", "55", "对比度"),
+                             ("0.010", "0.042", "墨迹占比")):
+            if lo not in body or hi not in body:
+                raise AssertionError(
+                    "字迹判据的%s区间与实测不符（期望 [%s, %s]）。"
+                    "放宽区间会削弱区分力，请先用真实截图回归验证再改。" % (name, lo, hi))
+        return "字迹判据三区间 + 极性校验齐全，与实测样本一致"
+    check("双路判据：字迹区间与实测一致（防放宽）", style_ranges_sane)
+
+    def grab_full_wired():
+        """三个调用点都必须把同一帧截图传进去，否则第二路静默失效。"""
+        n = src.count("full=(_cap")
+        if n < 2:
+            raise AssertionError(
+                "只有 %d 处调用传入了截图（期望 ≥2）。"
+                "漏传的地方字迹判据会静默跳过 → 那一处退化成只看颜色。" % n)
+        if "grab_full" not in src:
+            raise AssertionError("scan_buttons() 的 grab_full 参数不见了，截图无法带回。")
+        return "%d 处调用已接入同帧截图" % n
+    check("双路判据：调用点已接入同帧截图", grab_full_wired)
+
+    # 【2026-09-15 新增】第三路判据：OCR 文字复核（仅否决权）。
+    # 这是「已签到」vs「已结束」唯一可靠的区分手段——实测两者像素形态相同
+    # （墨迹 0.5580 vs 0.5522，宽高比均 1.01），纯几何/字迹永远分不开。
+    def ocr_path_exist():
+        missing = [fn for fn in ("_ocr_get_engine", "_ocr_read", "ocr_button_text", "ocr_veto_signed")
+                   if fn not in top_funcs]
+        if missing:
+            raise AssertionError(
+                "缺少 OCR 判据函数 %s —— 第三路判据被删了？"
+                "没有它，「已签到」和「已结束」就只剩时间窗一道防线。" % missing)
+        if "OCR_VERIFY_ENABLED" not in src:
+            raise AssertionError("OCR 开关 OCR_VERIFY_ENABLED 不见了（无法关闭/开启该路）")
+        return "OCR 判据函数齐全 + 有开关"
+    check("第三路判据：OCR 复核存在", ocr_path_exist)
+
+    def ocr_veto_only():
+        """OCR 必须**只能否决**，绝不能主动宣布成功。这是最关键的安全约束。"""
+        m = re.search(r"def ocr_veto_signed\((.*?)(?=\ndef )", src, re.S)
+        body = m.group(1) if m else ""
+        if not body:
+            raise AssertionError("找不到 ocr_veto_signed()")
+        # 必须明确有"读不到就放行（返回 None）"的分支
+        if "return None" not in body:
+            raise AssertionError(
+                "ocr_veto_signed() 没有 'return None'（读不到就放行）分支！"
+                "若把'读不到'当否决，脚本会在字体/缩放一变就集体摆烂，"
+                "这比误读更常见、危害更大。")
+        # 必须有否定词否决逻辑
+        if "_OCR_NEGATIVE" not in body:
+            raise AssertionError("ocr_veto_signed() 没有检查否定词 —— 否决权形同虚设。")
+        # 正向词必须只是"确认"，不能是"宣布成功"的路径
+        if "已签到" not in body:
+            raise AssertionError("ocr_veto_signed() 没有正向词判断")
+        return "OCR 仅行使否决权（读到否定词才否决，读不到放行）"
+    check("第三路判据：OCR 只有否决权，不会主动宣布成功", ocr_veto_only)
+
+    def ocr_wired_after_style():
+        """OCR 必须排在字迹判据**之后**（贵的放后面，只在即将判成功时复核一次）。"""
+        m = re.search(r"def signed_detail_button\((.*?)(?=\ndef )", src, re.S)
+        body = m.group(1) if m else ""
+        # 只看**实际调用**，不看注释（注释里会先提到函数名，会误判顺序）
+        p_style = body.find("is_already_signed_style(")
+        p_ocr = body.find("ocr_veto_signed(")
+        if p_style < 0 or p_ocr < 0:
+            raise AssertionError("signed_detail_button() 里找不到字迹或 OCR 判据的实际调用")
+        if p_ocr < p_style:
+            raise AssertionError(
+                "OCR 复核被排在了字迹判据之前！OCR 每次约 45~200ms，"
+                "应该只在'几何+字迹都过了、马上要判成功'时才跑。")
+        return "OCR 排在字迹判据之后（仅在即将判成功时复核）"
+    check("第三路判据：OCR 调用顺序正确（贵的在后）", ocr_wired_after_style)
+
     # 关键护栏仍在：详情页判定 + 重进刷新（这两个才是权威依据）
     for fn in ("open_signin_entry", "reopen_miniprogram_to_refresh", "click_sign_button"):
         check("关键函数仍在 %s()" % fn, lambda fn=fn: fn in top_funcs or (_ for _ in ()).throw(
@@ -357,8 +489,17 @@ def test_signin_contracts():
     # 详情页"已签到"判定必须同时受两道时间守卫保护
     # 因为灰色「已签到」与灰色「已结束」像素上无法区分，只能靠时间去排除历史记录。
     def time_guard_ok():
-        m = re.search(r"if signed_detail_button\(h, btns\):(.*?)(?=\n        if not green)", src, re.S)
-        body = m.group(1) if m else ""
+        # 【2026-09-15】调用形式已扩展为 `signed_detail_button(h, btns, full=...)`
+        # （双路判据需要同一帧截图）。正则必须容忍任意附加实参，否则这里会
+        # 因为"匹配不到"而 body 为空 → 误报"缺少守卫"（实际守卫还在）。
+        m = re.search(
+            r"if signed_detail_button\(h, btns.*?\):(.*?)(?=\n        if not green)",
+            src, re.S)
+        if not m:
+            raise AssertionError(
+                "找不到详情页'已签到'判定调用点（signed_detail_button(h, btns, ...)）——"
+                "函数可能被改名或调用点被删除，请人工确认守卫还在。")
+        body = m.group(1)
         if "before_signin_start()" not in body:
             raise AssertionError("详情页'已签到'判定缺少 before_signin_start() 守卫")
         if "_within_signin_window()" not in body:
@@ -783,6 +924,27 @@ def test_runtime():
             raise AssertionError("runtime 里缺依赖: %s" % missing)
         return "pyautogui/cv2/numpy/Pillow/pyperclip 齐全"
     check("运行依赖齐全（runtime 内置）", deps_ok)
+
+    def ocr_dep_ok():
+        """OCR 依赖（第三路判据）也必须内置在 runtime 里，否则拷到别的电脑会静默退化。"""
+        sp = os.path.join(HERE, "runtime", "Lib", "site-packages")
+        if not os.path.isdir(sp):
+            raise AssertionError("找不到 runtime\\Lib\\site-packages")
+        have = {n.lower() for n in os.listdir(sp)}
+        # 缺任一包 → 该机器上 OCR 复核会静默跳过（脚本仍能跑，但少一道防线）
+        need = ["winrt", "winrt_windows_media_ocr", "winrt_windows_globalization",
+                "winrt_windows_graphics_imaging", "winrt_windows_storage_streams",
+                "winrt_windows_foundation"]
+        missing = [p for p in need if not any(p in h for h in have)]
+        if missing:
+            raise AssertionError(
+                "runtime 里缺 OCR 依赖: %s\n"
+                "      → 缺了脚本仍能跑，但第三路判据会静默跳过（少一道防线）。\n"
+                "      → 重装：runtime\\python.exe -m pip install winrt-Windows.Media.Ocr "
+                "winrt-Windows.Globalization winrt-Windows.Graphics.Imaging "
+                "winrt-Windows.Storage.Streams winrt-Windows.Foundation" % missing)
+        return "winrt OCR 依赖齐全（合计约 2.9MB）"
+    check("OCR 依赖齐全（runtime 内置）", ocr_dep_ok)
 
 
 # =========================================================
