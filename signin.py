@@ -100,6 +100,49 @@ SEARCH_KEYWORD = CONFIG.get("search_keyword", "油学通")
 MINIAPP_TITLE = CONFIG.get("miniprogram_title", "油学通")   # 小程序独立窗口标题（用作窗口查找/置顶关键词）
 SIGNIN_TIME_START = CONFIG.get("signin_time_start", "20:50")  # 签到开放时间（仅提示用，不硬卡）
 SIGNIN_TIME_END = CONFIG.get("signin_time_end", "21:30")      # 签到结束时间（仅提示用，不硬卡）
+
+
+def _parse_hhm(text):
+    """把 "HH:MM" 解析成"当天第几分钟"（0~1439）。解析不出/越界 → 返回 None。
+
+    【2026-09-16 新增·P1-4】原来三处各自用 split(":") + int() 解析，且**都没校验范围**：
+      - "25:70" → 1570（不是合法的"第几分钟"，但照样参与比较，结果无意义）
+      - "21:30:99" → 抛异常（旧 _hhm 会吞掉返回 None，此处已显式处理）
+    更关键的是三处**各自实现**，跨午夜的判断口径没法统一（见 _window_contains）。
+
+    合法范围：0 <= hh <= 23 且 0 <= mm <= 59。越界一律当"配置写坏"。
+    """
+    try:
+        parts = str(text).strip().split(":")
+        if len(parts) != 2:
+            return None
+        hh, mm = int(parts[0]), int(parts[1])
+        if not (0 <= hh <= 23) or not (0 <= mm <= 59):
+            return None
+        return hh * 60 + mm
+    except Exception:
+        return None
+
+
+def _window_contains(now_min, start_min, end_min):
+    """判断"当天第几分钟 now_min"是否落在 [start_min, end_min] 窗口内。
+
+    【2026-09-16 新增·P1-4】**支持跨午夜窗口**（如 23:50 ~ 00:10）。
+    旧实现一律写成 `start <= now <= end`，跨午夜时 start > end，
+    该式**恒为 False** —— 也就是"签到窗口设成跨午夜，程序会认为永远不在窗口内"。
+    对"仅提示用"的时间窗，这会导致：
+      - _within_signin_window() 恒 False → 补救重试被误判为"已过时段"提前放弃
+      - _near 提示恒 False → 日志刷"不在签到窗口附近"的误导性告警
+    这是个静默失效（不报错、只是判断反了），符合本项目最该防的那类缺陷。
+
+    跨午夜判据：start > end 时，窗口是 [start, 24:00) ∪ [00:00, end]，
+    即 `now >= start or now <= end`。注意用 or（并集）而非 and。
+    """
+    if start_min is None or end_min is None:
+        return None                      # 调用方自行决定"配置坏"时怎么保守
+    if start_min <= end_min:
+        return start_min <= now_min <= end_min
+    return now_min >= start_min or now_min <= end_min
 # 【2026-09-15】按钮文字 OCR 复核开关（第三路判据，仅行使否决权，见 ocr_veto_signed）。
 # 默认开启：它只在"准备判成功"时复核一次，约 45ms，且读不到就放行，风险极低。
 # 如果你想彻底关掉（比如在没装中文 OCR 的机器上想省掉初始化日志），改这里或 config.json。
@@ -119,15 +162,21 @@ def before_signin_start():
       _within_signin_window() 是"**晚走守卫**"——配置读不出时也返回 True（"还在窗内"），
         代价是多跑一轮补救；回报是不会因为配置坏了就放弃补救。
       同一个"保守"在两条路径上落到同一个返回值，是因为它要防的坏结果各不相同：
-        这里防"假成功"，那里防"漏补救"。**改任一个的容错方向前，先读另一个的注释。**"""
-    try:
-        h, m = map(int, str(SIGNIN_TIME_START).strip().split(":"))
-    except Exception as e:
-        logger.warning(f"[前置] config.signin_time_start='{SIGNIN_TIME_START}' 解析失败（应为 HH:MM）: {e}"
-                       f"，按'签到未开始'保守处理")
+        这里防"假成功"，那里防"漏补救"。**改任一个的容错方向前，先读另一个的注释。**
+
+    【2026-09-16 修复·P1-4】改用共享的 _parse_hhm()：原来这里有一份独立的
+    `map(int, split(":"))` 解析且**不校验范围**——'25:70' 会被当成"合法的将来时刻"，
+    于是永远判"未开始"，把整轮都当早到处理（多跑详情页，最坏直接超时）。
+    现在三处调用点共用同一份解析口径，越界一律按"配置写坏"走保守分支。"""
+    hhm = _parse_hhm(SIGNIN_TIME_START)
+    if hhm is None:
+        logger.warning(f"[前置] config.signin_time_start='{SIGNIN_TIME_START}' 解析失败/越界"
+                       f"（应为 00:00~23:59），按'签到未开始'保守处理")
         return True
     now = datetime.now()
-    return (now.hour, now.minute) < (h, m)
+    return now.hour * 60 + now.minute < hhm
+
+
 LOG_DIR = abs_path(CONFIG["log_dir"])
 CONFIDENCE = CONFIG.get("confidence", 0.8)
 SHUTDOWN_DELAY = CONFIG.get("shutdown_delay", 60)
@@ -3327,12 +3376,22 @@ def _within_signin_window():
         代价是多重跑一轮详情页；回报是绝不会把昨天的记录当今天已签。
       两者同名"保守"却要防不同的坏结果（一个防漏补救、一个防假成功），
       所以**不能简单地"统一容错方向"**。改任一个前先读另一个的注释。
+
+    【2026-09-16 修复·P1-4】改用共享的 _parse_hhm()/_window_contains()：
+      - 补上范围校验（'25:70' 这种原来会被当成合法分钟数）
+      - 支持跨午夜窗口（原来 `start <= now <= end` 在 start > end 时恒为 False，
+        会让补救重试被误判成"已过时段"而提前放弃——静默失效）
     """
     try:
-        hh1, mm1 = [int(x) for x in str(SIGNIN_TIME_START).split(":")]
-        hh2, mm2 = [int(x) for x in str(SIGNIN_TIME_END).split(":")]
-        now = datetime.now().hour * 60 + datetime.now().minute
-        return hh1 * 60 + mm1 <= now <= hh2 * 60 + mm2
+        s = _parse_hhm(SIGNIN_TIME_START)
+        e = _parse_hhm(SIGNIN_TIME_END)
+        if s is None or e is None:
+            logger.warning("[前置] 时间窗配置解析失败/越界（start=%r end=%r），"
+                           "按'仍在窗内'保守处理以保住补救机会"
+                           % (SIGNIN_TIME_START, SIGNIN_TIME_END))
+            return True
+        now = datetime.now()
+        return bool(_window_contains(now.hour * 60 + now.minute, s, e))
     except Exception:
         return True
 
@@ -3460,15 +3519,21 @@ def main():
             return 1
         # 0.2 开跑前记录环境快照（锁屏/网络/WiFi/电源），并提示签到时间窗
         log_environment_snapshot()
-        def _hhm(text):
-            try:
-                hh, mm = str(text).split(":")
-                return int(hh) * 60 + int(mm)
-            except Exception:
-                return None
-        _s, _e = _hhm(SIGNIN_TIME_START), _hhm(SIGNIN_TIME_END)
+        # 【2026-09-16 修复·P1-4】原来这里有个内联的 _hhm()，与 before_signin_start()、
+        # _within_signin_window() 各写一份解析逻辑，且三处口径不一致（无范围校验、
+        # 不支持跨午夜）。现在统一走 _parse_hhm()/_window_contains()。
+        _s, _e = _parse_hhm(SIGNIN_TIME_START), _parse_hhm(SIGNIN_TIME_END)
         _hm = datetime.now().hour * 60 + datetime.now().minute
-        _near = (_s is None or _e is None) or (_s - 10 <= _hm <= _e + 5)
+        if _s is None or _e is None:
+            _near = True      # 配置读不出 → 不制造误导性告警
+        else:
+            # 窗口前后各留一点余量再判"附近"：跨越午夜时要做模 1440 环绕，
+            # 否则 23:50 的窗口在 00:05 会被判成"相差 1400 多分钟"。
+            def _ring(a, b):
+                d = abs(a - b) % 1440
+                return min(d, 1440 - d)
+            _near = (_ring(_hm, _s) <= 10) or (_ring(_hm, _e) <= 5) \
+                or bool(_window_contains(_hm, _s, _e))
         if not _near:
             logger.warning(f"[前置] 当前时间不在晚点名签到窗口({SIGNIN_TIME_START}-{SIGNIN_TIME_END})附近，此时按钮可能是灰的，最终仍以界面按钮为准")
         # 0.5 补丁：自动连接 XSYU_WLAN 并完成校园网网页认证（独立模块，失败不影响签到）

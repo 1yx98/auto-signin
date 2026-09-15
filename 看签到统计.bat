@@ -2,10 +2,10 @@
 chcp 936 >nul
 cd /d "%~dp0"
 set PYTHONIOENCODING=utf-8
-title ç­¾åˆ°å‡ºå‹¤æŠ¥è¡¨
+title Ç©µ½³öÇÚ±¨±í
 
 if not exist "runtime\python.exe" (
-  echo [ERROR] æ‰¾ä¸åˆ° runtime\python.exeï¼Œè¯·å…ˆæŒ‰ README ç¬¬å…­èŠ‚å‡†å¤‡è¿è¡Œæ—¶ã€‚
+  echo [ERROR] ÕÒ²»µ½ runtime\python.exe£¬ÇëÏÈ°´ README µÚÁù½Ú×¼±¸ÔËÐÐÊ±¡£
   pause
   exit /b 2
 )
@@ -13,7 +13,7 @@ if not exist "runtime\python.exe" (
 runtime\python.exe report.py %*
 echo.
 echo ------------------------------------------------------------
-echo æƒ³æ”¹ç»Ÿè®¡èŒƒå›´ï¼šåŒå‡»æœ¬æ–‡ä»¶çœ‹æœ€è¿‘ 30 å¤©ï¼›å‘½ä»¤è¡Œå¯åŠ å¤©æ•°å‚æ•°ï¼Œ
-echo ä¾‹å¦‚  report.py 7  = æœ€è¿‘ 7 å¤©ï¼Œreport.py 999 = å…¨éƒ¨åŽ†å²ã€‚
+echo Ïë¸ÄÍ³¼Æ·¶Î§£ºË«»÷±¾ÎÄ¼þ¿´×î½ü 30 Ìì£»ÃüÁîÐÐ¿É¼ÓÌìÊý²ÎÊý£¬
+echo ÀýÈç  report.py 7  = ×î½ü 7 Ìì£¬report.py 999 = È«²¿ÀúÊ·¡£
 echo ------------------------------------------------------------
 pause

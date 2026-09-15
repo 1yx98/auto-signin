@@ -216,6 +216,22 @@ def append_record(result, code=0, cost_sec=None, start_ts=None, end_ts=None,
         end_ts = float(end_ts) if end_ts else time.time()
         start_ts = float(start_ts) if start_ts else None
 
+        # 【2026-09-16 修复·P1-7】跨午夜的日期归属。
+        # 原来 date 一律取"现在"（= 结束时刻）的日期。但一次运行可能跨午夜
+        # （如 23:58 开跑、00:03 收尾）——那次签到**属于前一天**，
+        # 记成次日会让台账/统计整体错位一天：
+        #   - recent_records() 按 date 过滤 → 跨天那次的成败跑到明天去了
+        #   - stats() 的 fail_streak 按"自然日"数 → 连续失败被多算/少算一天
+        #   - should_escalate() 判断依据随之偏一天
+        # 判据：有 start_ts 时以**开跑时刻**所在日期为准（那才是"这一次签到"的日子）；
+        #       没有 start_ts（历史导入等）时退回"现在"。
+        day = now
+        if start_ts:
+            try:
+                day = datetime.fromtimestamp(start_ts)
+            except Exception:
+                day = now
+
         # 已有文件但表头与当前 FIELDS 不一致（老版本写的）→ 换新文件，绝不覆盖旧数据
         if os.path.isfile(path):
             try:
@@ -230,11 +246,11 @@ def append_record(result, code=0, cost_sec=None, start_ts=None, end_ts=None,
                 pass
 
         row = {
-            "date": now.strftime("%Y-%m-%d"),
+            "date": day.strftime("%Y-%m-%d"),
             "time": now.strftime("%H:%M:%S"),
             "result": result,
             "code": "" if code is None else code,
-            "weekday": _WEEKDAY_CN[now.weekday()],
+            "weekday": _WEEKDAY_CN[day.weekday()],
             "cost_sec": "" if cost_sec is None else "%.1f" % float(cost_sec),
             "start_ts": "" if not start_ts else "%.1f" % start_ts,
             "end_ts": "%.1f" % end_ts,

@@ -21,6 +21,7 @@ self_heal.py — 轻量纯规则自愈模块（不依赖 LLM，也不调外部 A
 import json
 import os
 import subprocess
+import sys
 import time
 import hashlib
 from datetime import datetime
@@ -71,12 +72,43 @@ def _load():
 
 
 def _save(state):
+    """保存自愈状态。
+
+    【2026-09-16 修复·P1-9】两处改动：
+
+    1) **写失败不再完全静默**（原来 `except Exception: pass`）。
+       后果链条（已实测确认）：_save 静默失败 → state 不落盘 →
+       下次 _load 读到旧的/空 state → preheat() 认为"无上次失败记录"跳过预热 →
+       **自愈永久停摆，而日志里一行提示都没有**。
+       这与本项目"失败要暴露不能掩盖"的铁律直接冲突。
+       现在往 stderr 说一句（不给 logger：本模块要保持可独立 import）。
+
+    2) **原子写盘**（临时文件 + os.replace）。
+       原来直接 `open(STATE_PATH, "w")` 覆盖写：进程正好在此刻被强杀，
+       会留下**半截 JSON**。下次 _load 解析失败 → state={} →
+       连续失败计数（consecutive）被清零 → 冷却机制失效，
+       同一个故障会被无限预热。用临时文件 + os.replace 就不会有半截文件。
+       这与 _guard_mark_in_progress() / step_tracer.flush() 的做法保持一致。
+    """
+    tmp = str(STATE_PATH) + ".tmp"
     try:
         STATE_DIR.mkdir(exist_ok=True)
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        os.replace(tmp, STATE_PATH)
+    except Exception as e:
+        # 清掉可能的半截临时文件（失败也无所谓）
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        try:
+            sys.stderr.write("[自愈] 状态写入失败（自愈将退化为'无上次失败记录'，"
+                             "预热不再生效）: %s: %s\n" % (type(e).__name__, e))
+            sys.stderr.flush()
+        except Exception:
+            pass
 
 
 def _kill_process(name):

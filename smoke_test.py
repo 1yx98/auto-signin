@@ -2426,6 +2426,379 @@ def _find_gray_bar(img, btn_aspect_min=4.0, btn_aspect_max=14.0):
 # =========================================================
 # main
 # =========================================================
+def _extract_signin_funcs(names):
+    """从 signin.py 抠出若干顶层函数单独执行（不 import signin，避免副作用）。
+
+    与 test_signin_contracts / test_wifi_link_connected 里同样的手法：
+    signin.py 一 import 就会建运行目录、清日志、初始化 pyautogui，
+    smoke_test 绝不能 import 它，只能用 AST 抠函数体出来跑。
+    """
+    src = open(os.path.join(HERE, "signin.py"), encoding="utf-8").read()
+    tree = ast.parse(src)
+    body = [n for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name in names]
+    got = {n.name for n in body}
+    missing = set(names) - got
+    if missing:
+        raise AssertionError("signin.py 里找不到函数: %s" % ", ".join(sorted(missing)))
+    g = {}
+    exec(compile(ast.Module(body=body, type_ignores=[]), "<signin-extract>", "exec"), g)
+    return g
+
+
+def test_time_window_cross_midnight():
+    """时间窗解析与跨午夜判定（P1-4）。
+
+    背景：三处用到"签到时间窗"的地方（before_signin_start / _within_signin_window /
+    前置提示 _near）原来各写一份解析，且都用 `start <= now <= end` 口径。
+    跨午夜窗口（如 23:50~00:10）下 start > end，该式**恒为 False** ——
+    也就是"把签到窗口设成跨午夜，程序会认为永远不在窗口内"，属静默失效。
+
+    这里锁死两件事：
+      1) _parse_hhm 必须做范围校验（'25:70' 这类不能当成合法分钟数）
+      2) _window_contains 必须支持跨午夜（并集语义：now>=start 或 now<=end）
+    """
+    section("时间窗：范围校验 + 跨午夜")
+
+    g = _extract_signin_funcs({"_parse_hhm", "_window_contains"})
+    ph, wc = g["_parse_hhm"], g["_window_contains"]
+
+    def parse_ok():
+        cases = [("20:50", 1250), ("21:30", 1290), ("00:00", 0), ("23:59", 1439),
+                 ("  21:30  ", 1290)]
+        for s, exp in cases:
+            got = ph(s)
+            assert got == exp, "_parse_hhm(%r) = %r，期望 %r" % (s, got, exp)
+        return "5 组合法时刻全部解析正确（含首尾 00:00 / 23:59）"
+
+    def parse_rejects():
+        # 这些必须判"配置写坏"（返回 None），否则会被当成合法分钟数参与比较
+        for s in ("25:70", "24:00", "-1:00", "21:60", "21:30:99", "", "aa:bb", None):
+            got = ph(s)
+            assert got is None, "_parse_hhm(%r) = %r，越界/非法值必须返回 None" % (s, got)
+        return "8 组越界/非法值全部拒绝（25:70 / 24:00 / -1:00 / 21:60 / 三段式 / 空 / 非数字 / None）"
+
+    def normal_window():
+        # 20:50~21:30 = 1250~1290
+        for now, exp in [(1250, True), (1270, True), (1290, True),
+                         (1249, False), (1291, False), (600, False)]:
+            got = wc(now, 1250, 1290)
+            assert bool(got) == exp, "普通窗口 now=%d -> %r，期望 %r" % (now, got, exp)
+        return "普通窗口 6 个边界点全对（含起止闭区间）"
+
+    def cross_midnight():
+        # 23:50~00:10 = 1430~10 —— 旧口径 start<=now<=end 在这里恒 False
+        for now, exp in [(1430, True), (1435, True), (1439, True),
+                         (0, True), (5, True), (10, True),
+                         (1429, False), (11, False), (720, False)]:
+            got = wc(now, 1430, 10)
+            assert bool(got) == exp, "跨午夜窗口 now=%d -> %r，期望 %r" % (now, got, exp)
+        return "跨午夜窗口 9 个边界点全对（23:50 / 23:55 / 23:59 / 00:00 / 00:05 / 00:10 在内；23:49 / 00:11 / 12:00 在外）"
+
+    def old_impl_provably_broken():
+        """负向对照：证明旧口径真的会失败，而不是"本来就没问题"。
+
+        如果哪天有人把 _window_contains 改回 `start <= now <= end`，
+        本断言会立刻失败（下面 6 个"确在窗口内"的点会变 False）。
+        """
+        wrong = 0
+        for now in (1430, 1435, 1439, 0, 5, 10):
+            if not wc(now, 1430, 10):
+                wrong += 1
+        assert wrong == 0, ("跨午夜窗口下有 %d/6 个'确在窗口内'的点被判为不在窗口内 —— "
+                            "很可能 _window_contains 被改回了 `start <= now <= end`" % wrong)
+        return "6 个'确在跨午夜窗口内'的点无一被判 False（旧口径在此会全判 False）"
+
+    def config_bad_is_none():
+        assert wc(100, None, 10) is None, "start 为 None 时应返回 None（交调用方保守处理）"
+        assert wc(100, 10, None) is None, "end 为 None 时应返回 None"
+        return "配置坏（None）时返回 None，不擅自判 True/False"
+
+    def single_source_of_truth():
+        """三处调用点必须统一走共享助手，不能再各写一份 split(':') 解析。
+
+        判据用 AST 查真实调用节点（不是查字符串 —— 注释/文档串会骗过字符串匹配，
+        本项目在这上面踩过两次坑）。
+        """
+        src = open(os.path.join(HERE, "signin.py"), encoding="utf-8").read()
+        tree = ast.parse(src)
+
+        def calls_of(fname):
+            for n in ast.walk(tree):
+                if isinstance(n, ast.FunctionDef) and n.name == fname:
+                    names = set()
+                    for c in ast.walk(n):
+                        if isinstance(c, ast.Call):
+                            f = c.func
+                            nm = getattr(f, "attr", None) or getattr(f, "id", None)
+                            if nm:
+                                names.add(nm)
+                    return names
+            return set()
+
+        for fname in ("before_signin_start", "_within_signin_window"):
+            names = calls_of(fname)
+            assert "_parse_hhm" in names, (
+                "%s() 没有调用 _parse_hhm()，说明又出现了独立的时间解析实现" % fname)
+        # 前置提示那段在 main() 里，main 很大，只要求它用到共享助手
+        names = calls_of("main")
+        assert "_parse_hhm" in names, "main() 的时间窗提示没有走 _parse_hhm()"
+        assert "_window_contains" in names, "main() 的时间窗提示没有走 _window_contains()"
+
+        # 反向：signin.py 里不应再有"本地重定义 _hhm"这种重复实现
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "_hhm":
+                raise AssertionError(
+                    "signin.py 第 %d 行又出现了内联的 _hhm() 局部实现，"
+                    "请改用共享的 _parse_hhm()" % n.lineno)
+        return ("before_signin_start / _within_signin_window / main 三处均走共享助手；"
+                "且无内联 _hhm 重复实现（AST 实测）")
+
+    check("时间窗：_parse_hhm 合法值解析", parse_ok)
+    check("时间窗：_parse_hhm 越界值必须拒绝", parse_rejects)
+    check("时间窗：普通窗口判定", normal_window)
+    check("时间窗：跨午夜窗口判定（旧实现恒 False）", cross_midnight)
+    check("时间窗：跨午夜真缺陷的负向对照", old_impl_provably_broken)
+    check("时间窗：配置坏时返回 None", config_bad_is_none)
+    check("时间窗：三处调用点统一走共享助手", single_source_of_truth)
+
+
+def test_history_cross_midnight_date():
+    """台账日期归属必须按"开跑时刻"，不是"结束时刻"（P1-7）。
+
+    一次运行可能跨午夜（23:58 开跑、00:03 收尾）。那次签到属于**前一天**，
+    若记成次日，会让 recent_records() 的日期过滤、stats() 的 fail_streak、
+    should_escalate() 的判断整体错位一天。
+
+    这里用真实调用 append_record（写进临时目录，不碰项目台账）+ 回读校验，
+    并配负向对照：把 start_ts 去掉，必须退回"现在"的日期。
+    """
+    section("台账：跨午夜的日期归属")
+
+    import tempfile
+    import history as H
+
+    def run_case(start_dt, expect_date):
+        with tempfile.TemporaryDirectory() as td:
+            # start_ts / end_ts 刻意跨天：start 在前一天 23:5x，end 在次日 00:0x
+            s_ts = start_dt.timestamp()
+            e_ts = s_ts + 400          # 约 6 分 40 秒后收尾
+            H.append_record("success", code=0, cost_sec=400.0,
+                            start_ts=s_ts, end_ts=e_ts,
+                            run_dir="run_synthetic", base_dir=td)
+            rows = H._read_rows(H._path(td))
+            assert rows, "append_record 没有写出任何行（可能 base_dir 用法不对）"
+            got = rows[-1].get("date")
+            assert got == expect_date, (
+                "跨午夜记录的 date = %r，期望 %r（该次签到属于开跑那天）" % (got, expect_date))
+            return rows[-1]
+
+    def cross_midnight_uses_start_day():
+        # 开跑 2026-09-15 23:58 → 收尾 2026-09-16 00:04，应记 09-15
+        row = run_case(datetime(2026, 9, 15, 23, 58, 0), "2026-09-15")
+        assert row.get("weekday") == "二", (
+            "weekday 应与 date 同一天（09-15 是周二），实际 %r" % row.get("weekday"))
+        return "23:58 开跑 / 00:04 收尾 → 记在 2026-09-15（周二），日期与星期一致"
+
+    def normal_case_unaffected():
+        # 不跨天的情况不能受影响：20:52 开跑 → 仍是当天
+        run_case(datetime(2026, 9, 15, 20, 52, 0), "2026-09-15")
+        return "普通（不跨天）运行仍记在开跑当天，未受影响"
+
+    def negative_no_start_ts_falls_back():
+        """负向对照：没有 start_ts 时（历史导入等）必须退回"现在"的日期。
+
+        若有人把 `if start_ts:` 保护去掉、直接 fromtimestamp(None)，
+        这里会抛异常/写错日期，断言即失败。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            H.append_record("fail", code=1, cost_sec=1.0,
+                            start_ts=None, end_ts=None, base_dir=td)
+            rows = H._read_rows(H._path(td))
+            assert rows, "start_ts=None 时也必须能写出一条记录"
+            today = datetime.now().strftime("%Y-%m-%d")
+            assert rows[-1].get("date") == today, (
+                "无 start_ts 时 date = %r，期望回退到今天 %r" % (rows[-1].get("date"), today))
+        return "start_ts 缺失时安全回退到'今天'，不会因 fromtimestamp(None) 崩掉"
+
+    check("台账：跨午夜按开跑日归属", cross_midnight_uses_start_day)
+    check("台账：不跨天时不受影响", normal_case_unaffected)
+    check("台账：无 start_ts 时安全回退（负向对照）", negative_no_start_ts_falls_back)
+
+
+def test_bat_encoding_consistency():
+    """所有 .bat 的编码必须与它声明的 chcp 一致（P1-8）。
+
+    真实现场：`看签到统计.bat` 的正文是 **UTF-8**，但第 2 行写着 `chcp 936`（GBK）。
+    cmd 按 936 解码 UTF-8 字节 → 所有中文（title、echo）显示成乱码，
+    甚至出现"非法 GBK 序列"的方块。同目录其它 6 个 .bat 都是 GBK，只有它不一致。
+
+    判据：带中文的 .bat 必须能被 GBK 解码（因为 chcp 936），否则就是编码错配。
+    """
+    section(".bat 编码一致性")
+
+    def all_bats_gbk_decodable():
+        import glob
+        if not glob.glob(os.path.join(HERE, "*.bat")):
+            raise AssertionError("项目根目录下找不到任何 .bat（路径不对？）")
+        offenders = []
+        checked = 0
+        for p in sorted(glob.glob(os.path.join(HERE, "*.bat"))):
+            raw = open(p, "rb").read()
+            if not any(b > 127 for b in raw):
+                continue                      # 纯 ASCII，编码无所谓
+            checked += 1
+            try:
+                raw.decode("gbk")
+            except Exception:
+                offenders.append(os.path.basename(p))
+        assert not offenders, (
+            "这些 .bat 含非 ASCII 字节但**无法按 GBK 解码**，"
+            "而它们都写了 `chcp 936` → 中文会显示成乱码：%s" % "、".join(offenders))
+        return "%d 个含中文的 .bat 全部可按 GBK 解码，与 chcp 936 一致" % checked
+
+    def looks_like_known_offender():
+        """定点回归：`看签到统计.bat` 曾经是 UTF-8 正文 + chcp 936。"""
+        p = os.path.join(HERE, "看签到统计.bat")
+        if not os.path.isfile(p):
+            raise AssertionError("看签到统计.bat 不存在")
+        raw = open(p, "rb").read()
+        try:
+            txt = raw.decode("gbk")
+        except Exception as e:
+            raise AssertionError("看签到统计.bat 又不能按 GBK 解码了（%s）—— 中文会乱码" % e)
+        # 再确认它确实含中文（防止有人"把中文删掉"来绕过测试）
+        assert any("\u4e00" <= ch <= "\u9fff" for ch in txt), (
+            "看签到统计.bat 里已经没有任何中文了——要么被误删，要么为绕过测试清空了内容")
+        return "看签到统计.bat 现已与其它 .bat 一致（GBK 正文 + chcp 936），中文可正常显示"
+
+    check(".bat：带中文的文件必须能按 GBK 解码", all_bats_gbk_decodable)
+    check(".bat：看签到统计.bat 编码定点回归", looks_like_known_offender)
+
+
+def test_self_heal_state_durability():
+    """自愈状态：写失败必须出声 + 必须原子写（P1-9）。
+
+    两个问题都真实存在过：
+      1) `_save()` 原来是 `except Exception: pass` —— 写失败完全无声。
+         后果链条：state 不落盘 → 下次 _load 读到空 state →
+         preheat() 认为"无上次失败记录"跳过预热 → **自愈永久停摆且零日志**。
+      2) 原来直接 `open(STATE_PATH, "w")` 覆盖写：进程恰好在此刻被强杀会留下
+         半截 JSON → 下次解析失败 → consecutive 计数清零 → 冷却失效 →
+         同一故障被无限预热。
+    """
+    section("自愈：状态持久化的可靠性")
+
+    import importlib.util
+
+    def load_self_heal():
+        spec = importlib.util.spec_from_file_location(
+            "self_heal_probe", os.path.join(HERE, "self_heal.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    sh = load_self_heal()
+
+    def roundtrip_ok():
+        """正常路径：写进去能读回来，且不留 .tmp 残渣。"""
+        st = {"last_failure": {"failure_code": "X"}, "consecutive": {"X": 2},
+              "history": [{"result": "fail"}]}
+        sh._save(st)
+        back = sh._load()
+        assert back.get("consecutive") == {"X": 2}, (
+            "写入后回读的 consecutive 不一致: %r" % back.get("consecutive"))
+        assert back.get("last_failure"), "last_failure 丢失"
+        tmp = str(sh.STATE_PATH) + ".tmp"
+        assert not os.path.exists(tmp), "原子写留下了 .tmp 残渣: %s" % tmp
+        return "写→读一致，且无 .tmp 残留（原子写生效）"
+
+    def failure_is_visible():
+        """负向：写失败必须往 stderr 说话，不能静默。
+
+        若有人把 _save 改回 `except Exception: pass`，本断言立刻失败。
+        """
+        import io
+        orig = sh.STATE_PATH
+        try:
+            sh.STATE_PATH = type(orig)("Z:/__nonexistent_dir_for_test__/state.json")
+            buf = io.StringIO()
+            old = sys.stderr
+            sys.stderr = buf
+            try:
+                sh._save({"a": 1})
+            finally:
+                sys.stderr = old
+            out = buf.getvalue().strip()
+            assert out, ("_save() 写失败时没有输出任何提示 —— "
+                         "自愈会在零日志的情况下永久停摆")
+            assert "自愈" in out, "失败提示应带 '[自愈]' 前缀便于检索，实际: %r" % out[:80]
+        finally:
+            sh.STATE_PATH = orig
+        return "写失败时 stderr 有明确提示（含 [自愈] 前缀）"
+
+    def atomic_write_no_partial():
+        """原子性：源码里必须是 临时文件 + os.replace，不能直接覆盖写。"""
+        src = open(os.path.join(HERE, "self_heal.py"), encoding="utf-8").read()
+        tree = ast.parse(src)
+        fn = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "_save":
+                fn = n
+                break
+        assert fn is not None, "self_heal.py 里找不到 _save()"
+        body = ast.unparse(fn)
+        assert "os.replace" in body, (
+            "_save() 没有用 os.replace 原子替换 —— 强杀时可能留下半截 JSON，"
+            "导致 consecutive 计数清零、冷却机制失效")
+        assert ".tmp" in body, "_save() 没有写临时文件"
+        return "「临时文件 + os.replace」原子写在位（AST 实测）"
+
+    check("自愈：状态写→读一致且无 tmp 残留", roundtrip_ok)
+    check("自愈：写失败必须出声（负向对照）", failure_is_visible)
+    check("自愈：必须原子写盘", atomic_write_no_partial)
+
+
+def test_no_unclosed_response_handles():
+    """网络请求的 response 必须关闭（P2-7）。
+
+    `capture_portal_url()` 里 `opener.open(req)` 在**非重定向**路径
+    （真连通了、没抛 HTTPError）下不会进 except，原来返回值被直接丢掉，
+    底层 socket 要等 GC 才回收。该函数在每次 wifi 自愈检查里都会调用。
+    """
+    section("资源：网络响应句柄")
+
+    def portal_probe_uses_with():
+        p = os.path.join(HERE, "wifi_helper", "browser_login.py")
+        src = open(p, encoding="utf-8").read()
+        tree = ast.parse(src)
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "capture_portal_url":
+                # 找所有 opener.open(...) 调用，确认每个都在 with 里
+                with_calls = set()
+                for w in ast.walk(n):
+                    if isinstance(w, ast.With):
+                        for item in w.items:
+                            for c in ast.walk(item.context_expr):
+                                if isinstance(c, ast.Call):
+                                    with_calls.add(c.lineno)
+                naked = []
+                for c in ast.walk(n):
+                    if isinstance(c, ast.Call):
+                        f = c.func
+                        if getattr(f, "attr", None) == "open" and \
+                           getattr(getattr(f, "value", None), "id", None) == "opener":
+                            if c.lineno not in with_calls:
+                                naked.append(c.lineno)
+                assert not naked, (
+                    "capture_portal_url() 里有未用 with 关闭的 opener.open()，"
+                    "行号 %s —— 响应对象泄漏，socket 要等 GC" % naked)
+                return "capture_portal_url() 的 opener.open() 已用 with 关闭（AST 实测）"
+        raise AssertionError("browser_login.py 里找不到 capture_portal_url()")
+
+    check("资源：portal 探测的响应已关闭", portal_probe_uses_with)
+
+
 def main():
     print("=" * 60)
     print("油学通签到系统 · 冒烟测试（离线，不会碰微信）")
@@ -2461,6 +2834,11 @@ def main():
     test_global_timeout_guards_long_waits()
     test_prune_visible_and_sideeffect_free()
     test_no_redundant_recompute_and_silent_swallow()
+    test_time_window_cross_midnight()
+    test_history_cross_midnight_date()
+    test_bat_encoding_consistency()
+    test_self_heal_state_durability()
+    test_no_unclosed_response_handles()
 
     print("\n" + "=" * 60)
     print("通过 %d 项，失败 %d 项" % (len(PASSED), len(FAILED)))

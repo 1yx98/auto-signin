@@ -348,7 +348,13 @@ def capture_portal_url(timeout=8):
     opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=_SSL_CTX))
     try:
         req = urllib.request.Request(REDIRECT_PROBE, headers={"User-Agent": "Mozilla/5.0"})
-        opener.open(req, timeout=timeout)
+        # 【2026-09-16 修复·P2-7】opener.open() 返回的 response 在**非重定向**路径
+        # （即真的连通了、没抛 HTTPError）下不会进 except，原来就直接丢掉了 ——
+        # 底层 socket 要等 GC 才回收。这个函数在每次 wifi 自愈检查里都会被调用，
+        # 攒下来可能耗尽句柄/短暂占用连接。用 with 显式关掉。
+        # 注意：走 HTTPError 分支时异常自带已关闭的响应，不需要 with。
+        with opener.open(req, timeout=timeout) as _resp:
+            pass          # 我们只要"有没有被 302 到门户"这个信号，读 body 无意义
     except urllib.error.HTTPError as e:
         loc = e.headers.get("Location") if e.headers else None
         if loc and "10.123.0.253" in loc:
