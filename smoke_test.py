@@ -264,6 +264,43 @@ def test_signin_contracts():
         return "失败目录受保护"
     check("清理时保护失败现场", protect_ok)
 
+    # ★ 假成功防线（2026-09-15 事故）。这是全项目最高危的 bug 类型：
+    # 通知说成功、实际没签到 → 静默漏签。两道防线必须一直在。
+    def roi_clip_ok():
+        m = re.search(r"def first_card_status_green\(.*?\n(?=def )", src, re.S)
+        if not m:
+            raise AssertionError("找不到 first_card_status_green()（列表已签短路没了？）")
+        body = m.group(0)
+        if "win_rect(hwnd)" not in body:
+            raise AssertionError("列表已签判定没有取小程序窗口矩形，ROI 会扫到窗口外（桌面壁纸→假成功）")
+        if "max(x1, wl)" not in body or "min(x2, wr)" not in body:
+            raise AssertionError("ROI 没有夹进窗口内（缺 max(x1,wl)/min(x2,wr)），假成功防线①失效")
+        if "roi_w <= 40" not in body:
+            raise AssertionError("ROI 被裁到过小时没有拒绝判定（缺 roi_w<=40 护栏）")
+        return "ROI 夹紧 + 过小拒绝"
+    check("防线①：ROI 必须夹进小程序窗口", roi_clip_ok)
+
+    def green_shape_ok():
+        m = re.search(r"def first_card_status_green\(.*?\n(?=def )", src, re.S)
+        body = m.group(0) if m else ""
+        if "aspect < 1.8" not in body:
+            raise AssertionError("绿块判定没有宽高比检查，桌面绿色壁纸会被当成'已签到'")
+        if "fill < 0.35" not in body:
+            raise AssertionError("绿块判定没有填充率检查，大片纯色会被误判")
+        if "return False" not in body.split("aspect < 1.8")[1][:400]:
+            raise AssertionError("绿块形状可疑时没有返回 False（没按未签处理）")
+        return "宽高比≥1.8 且 填充率≥0.35 才采信"
+    check("防线②：绿块形状必须像状态文字", green_shape_ok)
+
+    # 列表短路必须"宁可漏判也不误判"：拿不到窗口矩形时不许乐观判成功
+    def conservative_ok():
+        m = re.search(r"def first_card_status_green\(.*?\n(?=def )", src, re.S)
+        body = m.group(0) if m else ""
+        if "win_rect" in body and "0, 0, Wpx, Hpx" not in body:
+            raise AssertionError("拿不到窗口矩形时没有保守回退（应退化为全屏但仍受形状检查约束）")
+        return "无窗口信息时保守回退"
+    check("判定取向：宁可漏判不可误判", conservative_ok)
+
 
 def test_run_outcome():
     section("失败现场判定 _run_outcome()")

@@ -1506,13 +1506,39 @@ def first_card_status_green(hwnd, title_cx, title_cy):
     '进行中-已签到'(绿)；历史已结束='已结束-已签到'(绿+橙)。返回 (bool, str 描述)。
     【2026-09-12 修复】必须同时检测红色'未签到'：红存在则强制返回 False，
     防止 ROI 偏移到下方已签卡片或绿色 UI 元素造成假阳性。
+    【2026-09-15 修复·假成功】ROI 必须**夹在小程序窗口矩形内**！
+    当天 20:55 那次误判为成功，实测根因：本次微信窗口只有 1119 宽（以往全屏 2893），
+    小程序窗口在 x[1012,1872]，而 ROI 按"标题中心+380~700"算出来是 x[1813,2133]，
+    右半边**伸到窗口外**，扫到了桌面上青绿色斜纹壁纸（绿像素 3218px，窗口内只有 80px），
+    于是被判成"绿块=已签到"→ 假成功、推绿卡、实际没签到。
+    现在 ROI 与窗口矩形求交集；交集太小就直接返回 False（宁可走完整流程去详情页验证，
+    也不能靠窗口外的像素判成功）。另外把 ROI 坐标打进日志，下次排查可直接对照。
     纯只读，不点击。"""
     try:
         full = screen_bgr(); Hpx, Wpx = full.shape[:2]
+        # 窗口矩形（小程序窗口）；拿不到就退回整屏（保守：不因此判成功）
+        rect = win_rect(hwnd) if hwnd else None
+        if rect:
+            wl, wt, wr, wb = rect
+            logger.info(f"[列表已签] 窗口rect=({wl},{wt},{wr},{wb}) 标题中心=({title_cx},{title_cy})")
+        else:
+            wl, wt, wr, wb = 0, 0, Wpx, Hpx
+            logger.warning("[列表已签] 拿不到小程序窗口矩形，ROI 不做窗口约束（本判定将更保守）")
         y1 = max(0, title_cy - 132); y2 = min(Hpx, title_cy - 55)
         x1 = max(0, title_cx + 380); x2 = min(Wpx, title_cx + 700)
-        if x2 - x1 <= 10 or y2 - y1 <= 10:
-            return False, "ROI异常"
+        # ★核心修复：把 ROI 夹进窗口内，绝不允许读到窗口外的桌面像素
+        cx1, cx2 = max(x1, wl), min(x2, wr)
+        cy1, cy2 = max(y1, wt), min(y2, wb)
+        clipped = (cx1 != x1 or cx2 != x2 or cy1 != y1 or cy2 != y2)
+        if clipped:
+            logger.warning(f"[列表已签] ROI 越出小程序窗口，已夹紧：原x[{x1},{x2}]y[{y1},{y2}] "
+                           f"-> 夹后x[{cx1},{cx2}]y[{cy1},{cy2}]")
+        x1, x2, y1, y2 = cx1, cx2, cy1, cy2
+        roi_w, roi_h = x2 - x1, y2 - y1
+        logger.info(f"[列表已签] 实际ROI x[{x1},{x2}] y[{y1},{y2}] 尺寸={roi_w}x{roi_h}")
+        # 夹紧后太窄/太扁 = ROI 基本落在窗口外，这种位置本来就不可信
+        if roi_w <= 40 or roi_h <= 10:
+            return False, "ROI被窗口裁剪到过小(%dx%d)，不敢据此判成功" % (roi_w, roi_h)
         sub = full[y1:y2, x1:x2]
         hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
         # 绿色检测（已签到）
@@ -1547,8 +1573,18 @@ def first_card_status_green(hwnd, title_cx, title_cy):
         # 红色'未签到'优先：只要检测到红色，强制判定为未签（防止绿色假阳性）
         if has_red:
             return False, f"检测到红色'未签到'({red_desc})，强制未签 | {green_desc}"
+        # ★第二道防线（2026-09-15）：绿块必须"像一段状态文字"，才敢判已签到。
+        # 状态行是「进行中 · 已签到」这类横排文字，特征：明显宽扁 + 填充实 + 不像零散斑块。
+        # 桌面壁纸/图标/UI 装饰的绿色往往是散点或不规则形状，用下面两条卡掉。
         if has_green:
-            return True, f"{green_desc}（无红色）"
+            w, h, px = best_g
+            aspect = w / float(h) if h else 0
+            fill = px / float(w * h) if (w and h) else 0
+            if aspect < 1.8 or fill < 0.35:
+                logger.warning(f"[列表已签] 绿块形状不像状态文字（{w}x{h} 宽高比={aspect:.2f} 填充率={fill:.2f}），"
+                               f"不予采信，按未签处理走完整流程验证")
+                return False, (f"绿块形状可疑({w}x{h} 比={aspect:.2f} 填={fill:.2f})，不判成功 | {green_desc}")
+            return True, f"{green_desc}（宽比{aspect:.1f} 填充{fill:.2f} 无红色）"
         return False, f"无绿无红 | {green_desc} | {red_desc}"
     except Exception as e:
         logger.warning(f"[列表已签] 检测异常（按未签处理，不影响主流程）: {e}")
