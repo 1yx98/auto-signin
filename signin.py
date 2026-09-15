@@ -1938,6 +1938,9 @@ def click_sign_button():
 
     # ---------- 阶段A：详情页（等待蓝色签到按钮，最多12秒，自愈信号触发时延长到20秒） ----------
     DETAIL_WAIT = 20 if self_heal.consume_signal("wait_longer_detail") else 12
+    # finish_clicks 必须在阶段A 之前初始化：阶段A 的时间窗守卫要靠它判断"本轮是否已提交过签到请求"。
+    # （若延后到阶段B 才定义，阶段A 引用它会 UnboundLocalError，被 except 吞掉→守卫静默失效。）
+    finish_clicks = 0
     blue = green = gray = None
     t0 = time.time()
     while time.time() - t0 < DETAIL_WAIT:
@@ -1961,16 +1964,24 @@ def click_sign_button():
             # 已知限制：灰色「已签到」和灰色「已结束」在像素上无法区分（都是同款灰宽按钮）。
             # 若页面停在【昨天那条"已结束"】记录上（小程序缓存没刷新），会被误判成"今天已签到"→ 假成功。
             # 现在唯一的物理约束是时间：签到只可能在 [signin_time_start, signin_time_end] 内进行，
-            # 时段之外的"已签到"记录**不可能是今天签的**（今天的记录在时段外还没有"已签到"状态）。
-            # 因此：超出时段仍显示"已签到"→ 一律视为历史记录，判 not_time，绝不判成功。
-            if not _within_signin_window():
+            # 时段之外的"已签到"记录**不可能是今天签的**。
+            #
+            # 注意（2026-09-15 修正误伤风险）：本守卫只在【尚未提交过签到请求】时生效。
+            # 因为第二轮重试可能在 21:30 之后才进来，此时若第一轮其实已签成功，页面会显示"已签到"——
+            # 那是**真实成功**，不能当成历史记录否掉（否则会把成功漏报成 not_time）。
+            # 阶段A 走到这里时 finish_clicks 恒为 0（还没点过"完成签到"），故用它作为"未提交"的判据。
+            if finish_clicks == 0 and not _within_signin_window():
                 logger.warning(f"[详情页] 检测到灰色'已签到'，但当前不在签到时段"
-                               f"[{SIGNIN_TIME_START}~{SIGNIN_TIME_END}]内——该记录必然不是今天的，"
-                               f"判 not_time（防止把昨天'已结束'记录误判成今天已签）")
+                               f"[{SIGNIN_TIME_START}~{SIGNIN_TIME_END}]内，且本轮尚未提交过签到请求"
+                               f"——该记录必然不是今天的，判 not_time（防止把昨天'已结束'记录误判成今天已签）")
                 shot("详情页_时段外已签_疑历史记录")
                 TRACE.end_step("skipped", "OUT_OF_WINDOW_SIGNED")
                 return "not_time"
-            logger.info("[详情页] 当前已是灰色'已签到'（今日已签/上一轮已签成功），直接判定成功")
+            if finish_clicks > 0:
+                logger.info(f"[详情页] 检测到灰色'已签到'，且本轮已提交过签到请求"
+                            f"（finish_clicks={finish_clicks}）——判定为本轮签到成功")
+            else:
+                logger.info("[详情页] 当前已是灰色'已签到'（今日已签/上一轮已签成功），直接判定成功")
             shot("详情页_已是已签到")
             TRACE.end_step("short_circuit", "DETAIL_ALREADY_SIGNED")
             return "success"
@@ -1996,6 +2007,8 @@ def click_sign_button():
     #  · 地图页 = 蓝色消失，底部'完成签到'定位后由灰变绿，这个绿色才点，且【只点一次】。
     #  · 定位漂移（灰色'不在区域内'）时：点'重新定位'，仍不行就重连一次 WiFi。
     #  · 点到绿色只代表'请求已发起'，不代表成功——必须进入 B-2 刷出灰色'已签到'才算。
+    #  注意：这里重置 finish_clicks=0 是刻意的——它记录的是"本轮点了'完成签到'几次"，
+    #  进入阶段B 时确实还没点过。阶段A 用它做的"是否已提交"判断已经用完了，互不干扰。
     t0 = time.time(); finish_clicks = 0; last_g = -99
     entered_map = False; blue_clicks = 0
     last_relocate = -99; relocate_clicks = 0; wifi_refreshed = False

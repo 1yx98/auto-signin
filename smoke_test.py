@@ -370,6 +370,27 @@ def test_signin_contracts():
         return "双时间守卫齐全（未开始 + 时段外）"
     check("详情页已签到判定有双时间守卫", time_guard_ok)
 
+    # finish_clicks 必须在阶段A 引用之前初始化
+    # （否则阶段A 的时间窗守卫会 UnboundLocalError → 被 except 吞掉 → 守卫静默失效）
+    def finish_clicks_init_ok():
+        m = re.search(r"def click_sign_button\(\):(.*?)(?=\ndef )", src, re.S)
+        body = m.group(1) if m else ""
+        if not body:
+            raise AssertionError("找不到 click_sign_button()")
+        # 找第一次出现的位置
+        use_pos = body.find("finish_clicks == 0 and not _within_signin_window()")
+        init_pos = body.find("finish_clicks = 0")
+        if use_pos < 0:
+            raise AssertionError("阶段A 的时间窗守卫里没找到 finish_clicks 判断")
+        if init_pos < 0:
+            raise AssertionError("click_sign_button() 里找不到 finish_clicks 初始化")
+        if init_pos > use_pos:
+            raise AssertionError(
+                "finish_clicks 的初始化出现在使用之后！阶段A 引用它会 UnboundLocalError，"
+                "被 except 吞掉导致时间窗守卫静默失效。请把初始化提到阶段A 之前。")
+        return "finish_clicks 初始化早于使用"
+    check("阶段A守卫依赖的变量已先初始化", finish_clicks_init_ok)
+
     def conservative_ok():
         m = re.search(r"def first_card_status_green\(.*?\n(?=def )", src, re.S)
         body = m.group(0) if m else ""
