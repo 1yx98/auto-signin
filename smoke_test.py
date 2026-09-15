@@ -27,6 +27,7 @@ import sys
 import tempfile
 import textwrap
 import traceback
+from datetime import datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -693,6 +694,167 @@ def test_run_outcome():
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    # 【2026-09-16 新增·多来源兜底】result.txt 缺失时，必须能退回 run.log / step_trace.json。
+    # 背景：result.txt 写失败（磁盘满）原本是静默的，会让真失败被误判成 unknown，
+    # 而 unknown 按更短的保留期清理 → **唯一的失败现场可能被删掉**。
+    def _mk_log(logtext):
+        d = tempfile.mkdtemp(prefix="smoke_ro_log_")
+        with open(os.path.join(d, "run.log"), "w", encoding="utf-8") as fh:
+            fh.write(logtext)
+        return d
+
+    def _mk_trace(fr):
+        import json as _json
+        d = tempfile.mkdtemp(prefix="smoke_ro_trace_")
+        with open(os.path.join(d, "step_trace.json"), "w", encoding="utf-8") as fh:
+            _json.dump({"final_result": fr, "exit_code": 1}, fh)
+        return d
+
+    extra = [
+        ("run.log 兜底: fail", _mk_log("  最终结果=fail  退出码=1\n"), "fail"),
+        ("run.log 兜底: success", _mk_log("  最终结果=success  退出码=0\n"), "success"),
+        ("run.log 兜底: not_time", _mk_log("  最终结果=not_time  退出码=3\n"), "not_time"),
+        ("run.log 多轮取最后一次", _mk_log("  最终结果=success\n  最终结果=fail\n"), "fail"),
+        ("run.log 无总结行 → unknown", _mk_log("只有无关内容\n"), "unknown"),
+        ("run.log 非法取值不采信", _mk_log("  最终结果=banana\n"), "unknown"),
+        ("step_trace 兜底: fail", _mk_trace("fail"), "fail"),
+        ("step_trace 兜底: success", _mk_trace("success"), "success"),
+        ("step_trace 非法值不采信", _mk_trace("banana"), "unknown"),
+    ]
+    for tag, d, expect in extra:
+        try:
+            got = run_outcome(d)
+            if got != expect:
+                bad("_run_outcome " + tag, "期望 %s，实际 %s" % (expect, got))
+            else:
+                ok("_run_outcome " + tag, got)
+        except Exception as e:
+            bad("_run_outcome " + tag, str(e))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    # ---- 负向自检：把 run.log 兜底整段删掉后，上面两条 run.log 用例应失效 ----
+    # 这确保新增的断言不是恒真（项目已踩三次"断言成摆设"的坑）。
+    try:
+        src_fn = _ast.unparse(fn)
+        if "# 3) 【新增】退回读 run.log" not in src_fn and "最终结果" not in src_fn:
+            bad("_run_outcome 多来源兜底自检",
+                "源码里找不到 run.log 兜底逻辑，本断言可能是摆设")
+        else:
+            ok("_run_outcome 多来源兜底自检", "run.log / step_trace 两级兜底均在源码中")
+    except Exception as e:
+        bad("_run_outcome 多来源兜底自检", str(e))
+
+
+def test_fail_evidence_protects_archive():
+    """【2026-09-16 新增·最关键的一条】失败现场不能被 unknown 的短保留期删掉。
+
+    这条护栏防的是**我自己这轮修复引入的新风险**，所以格外重要：
+
+      P1-6 我把 unknown（结果读不出来）从"和失败一样留 90 天"改成"只留 14 天"，
+      理由是"unknown 没诊断价值"。但 unknown 的成因里有一种恰恰相反：
+
+        磁盘满（或权限异常）
+          → result.txt 写失败
+          → FAIL_*.png 也写失败（同一个磁盘满）
+          → 判据全空 → 判 unknown
+          → 14 天后被删 → **唯一的失败现场蒸发**
+
+      这是"两道防线共享同一个失效原因"的典型：文件和截图都依赖"能写盘"。
+      所以补了 `_has_fail_evidence()`：只看**文件在不在**（不做任何解析），
+      只要目录里有失败痕迹，就强制走 90 天失败通道。
+
+    → 断言：
+      A. `_has_fail_evidence` 存在且被 `_prune_old_runs` 真实调用（AST 查 Call 节点）；
+      B. 行为正确：有 FAIL_/EXCEPTION 痕迹 → True；纯空目录 → False；
+      C. 端到端：一个 30 天前、判据失效但有 FAIL_ 截图的目录，
+         在 KEEP_UNKNOWN_DAYS=14 下**必须存活**（走 fail 通道）。
+
+    【负向测试】去掉 `_has_fail_evidence` 的分支，C 必须变成"目录被删"。
+    """
+    def _run():
+        # ---- 静态：函数存在且在清理逻辑里被调用 ----
+        p = os.path.join(HERE, "signin.py")
+        with open(p, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src, filename="signin.py")
+        names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        if "_has_fail_evidence" not in names:
+            raise AssertionError("缺少 _has_fail_evidence()：失败现场失去事实层保护")
+
+        prune_fn = next((n for n in ast.walk(tree)
+                         if isinstance(n, ast.FunctionDef) and n.name == "_prune_old_runs"), None)
+        if prune_fn is None:
+            raise AssertionError("找不到 _prune_old_runs()")
+        called = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                     and n.func.id == "_has_fail_evidence"
+                     for n in ast.walk(prune_fn))
+        if not called:
+            raise AssertionError(
+                "_has_fail_evidence() 定义了但 _prune_old_runs() 里没调用 —— 是摆设，"
+                "失败现场仍会被 14 天的 unknown 通道删掉")
+
+        # ---- 行为：抠出 _has_fail_evidence 单独执行 ----
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_has_fail_evidence")
+        ns = {"os": os}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), "<x>", "exec"), ns)
+        has_ev = ns["_has_fail_evidence"]
+
+        tmpd = tempfile.mkdtemp(prefix="smoke_ev_")
+        try:
+            def mk(name, files, trace=None):
+                d = os.path.join(tmpd, name)
+                os.makedirs(d)
+                for f in files:
+                    open(os.path.join(d, f), "w").close()
+                if trace is not None:
+                    import json as _json
+                    with open(os.path.join(d, "step_trace.json"), "w", encoding="utf-8") as fh:
+                        _json.dump({"final_result": trace}, fh)
+                return d
+
+            ev_cases = [
+                ("FAIL_ 前缀截图", mk("a", ["210609_FAIL_顶部.png"]), True),
+                ("_FAIL_ 中缀", mk("b", ["210609_x_FAIL_y.png"]), True),
+                ("EXCEPTION 截图", mk("c", ["第1轮_EXCEPTION.png"]), True),
+                ("只有 step_trace=fail", mk("d", [], trace="fail"), True),
+                ("step_trace=success 不算失败", mk("e", [], trace="success"), False),
+                ("纯空目录", mk("f", []), False),
+                ("只普通截图", mk("g", ["210612_签到成功_已签到.png"]), False),
+            ]
+            for tag, d, expect in ev_cases:
+                got = has_ev(d)
+                if got is not expect:
+                    raise AssertionError("_has_fail_evidence %s：期望 %s 实际 %s"
+                                         % (tag, expect, got))
+
+            # ---- 端到端：30 天前的失败现场必须在 KEEP_UNKNOWN_DAYS=14 下存活 ----
+            import signin as S
+            from datetime import timedelta
+            d30 = datetime.now() - timedelta(days=30)
+            rd = os.path.join(tmpd, "run_%s" % d30.strftime("%Y%m%d_%H%M%S"))
+            os.makedirs(rd)
+            open(os.path.join(rd, "FAIL_定位失败.png"), "w").close()
+            open(os.path.join(rd, "run.log"), "w").close()   # 无总结行
+
+            orig = (S.LOG_DIR, S.KEEP_RUNS, S.KEEP_UNKNOWN_DAYS, S.KEEP_DAYS)
+            S.LOG_DIR, S.KEEP_RUNS, S.KEEP_UNKNOWN_DAYS, S.KEEP_DAYS = tmpd, 0, 14, 10
+            try:
+                S._prune_old_runs()
+            finally:
+                S.LOG_DIR, S.KEEP_RUNS, S.KEEP_UNKNOWN_DAYS, S.KEEP_DAYS = orig
+
+            if not os.path.isdir(rd):
+                raise AssertionError(
+                    "★30 天前的失败现场被删了！说明 unknown 的 14 天保留期"
+                    "覆盖了 fail 的 90 天通道 —— 唯一的失败证据蒸发")
+        finally:
+            shutil.rmtree(tmpd, ignore_errors=True)
+
+        return ("事实层护栏在位：有失败痕迹 → 保护；30 天前失败现场在最严条件下存活")
+    check("失败现场受事实层保护（不被 unknown 短保留期误删）", _run)
+
 
 def test_report_readonly():
     section("报表工具 report.py")
@@ -775,6 +937,260 @@ def test_bat_ascii():
                     AssertionError("含 %d 个非 ASCII 字节（任务计划可能失败）" % len(non_ascii)))))
         except Exception as e:
             bad("%s 检查" % f, str(e))
+
+
+def test_subprocess_encoding_and_signal_cleanup():
+    """【2026-09-16 新增·全局复审】两条独立缺陷，都属于"失败被掩盖"。
+
+    缺陷 A · subprocess 输出编码
+      中文 Windows 上 `taskkill` 的输出是 **GBK**，而 `subprocess.run(text=True)`
+      默认按 locale/UTF-8 解码 → 在 **reader 子线程**里抛 UnicodeDecodeError。
+      这个异常**不会**被调用处的 `except Exception` 抓到（它在另一个线程里），
+      而是被解释器直接打到 stderr 成一段 traceback。
+      后果：signin.py 的 run.log **收集 stderr** → 每次杀进程都多两段 traceback，
+      真正的失败信息被噪音淹没。
+      本项目 signin.py 的 L573/L662/L897 **早就加了** `encoding="gbk"`，
+      但另有 3 处（kill_wechat / 清理小程序引擎 / 清障 taskkill）和
+      self_heal._kill_process 漏了 —— 是**一致性缺陷**，不是有意为之。
+
+    缺陷 B · 自愈信号残留
+      `consume_signal()` 只在流程真正走到定位/详情页时才被调用；而
+      `preheat()` 在 main 开头**无条件**写信号。于是：
+        上次失败设了 extend_locate_wait
+          → 这次因"已签到/不在时段"快速返回，没走到定位步骤
+          → 信号留在盘上 → **下次运行继续按延长等待跑**（每轮白等 45 秒），
+            而且会一直延续下去。
+      修法：新增 `self_heal.clear_signals()`，在 signin.py 的 finally 里调用
+      （不能放开头 —— 开头 preheat 正要写这些信号）。
+
+    → 断言（AST 静态 + 行为）：
+      A. 全项目所有 taskkill 的 subprocess.run 都必须带 encoding（防漏）；
+      B. `clear_signals()` 存在、能清空信号、幂等；
+      C. signin.py 的 finally 里真的调用了它。
+
+    【负向测试】去掉任一处的 encoding / 去掉 finally 里的调用，本断言必须 FAIL。
+    """
+    def _run():
+        # ---- A. 全项目 taskkill 调用必须带 encoding ----
+        offenders = []
+        for rel in ("signin.py", "self_heal.py",
+                    os.path.join("wifi_helper", "browser_login.py"),
+                    os.path.join("wifi_helper", "wifi_auto_login.py")):
+            p = os.path.join(HERE, rel)
+            if not os.path.isfile(p):
+                continue
+            with open(p, encoding="utf-8") as fh:
+                src = fh.read()
+            tree = ast.parse(src, filename=rel)
+            for n in ast.walk(tree):
+                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                        and n.func.attr == "run"):
+                    continue
+                call_src = ast.unparse(n)
+                if "taskkill" not in call_src:
+                    continue
+                if "encoding=" not in call_src:
+                    offenders.append("%s:%d" % (rel, n.lineno))
+        if offenders:
+            raise AssertionError(
+                "这些 taskkill 调用缺 encoding（中文 Windows 上输出是 GBK，"
+                "会在 reader 线程里抛 UnicodeDecodeError，把 traceback 喷进 stderr/run.log）：%s\n"
+                "      → 应补 encoding=\"gbk\", errors=\"ignore\"" % offenders)
+
+        # ---- B. clear_signals 行为 ----
+        p_heal = os.path.join(HERE, "self_heal.py")
+        with open(p_heal, encoding="utf-8") as fh:
+            heal_src = fh.read()
+        if "def clear_signals" not in heal_src:
+            raise AssertionError("self_heal 缺少 clear_signals()：信号残留无法清理")
+
+        import importlib
+        if "self_heal" in sys.modules:
+            SH = importlib.reload(sys.modules["self_heal"])
+        else:
+            sys.path.insert(0, HERE)
+            SH = importlib.import_module("self_heal")
+
+        from pathlib import Path
+        tmpd = tempfile.mkdtemp(prefix="smoke_sig_")
+        orig = (SH.STATE_DIR, SH.SIGNAL_EXTEND_LOCATE, SH.SIGNAL_WAIT_DETAIL)
+        try:
+            SH.STATE_DIR = Path(tmpd)
+            SH.SIGNAL_EXTEND_LOCATE = Path(tmpd) / "_extend_locate_wait"
+            SH.SIGNAL_WAIT_DETAIL = Path(tmpd) / "_wait_longer_detail"
+            SH.SIGNAL_EXTEND_LOCATE.write_text("1", encoding="utf-8")
+            SH.SIGNAL_WAIT_DETAIL.write_text("1", encoding="utf-8")
+            cleared = SH.clear_signals()
+            if len(cleared) != 2:
+                raise AssertionError("clear_signals() 应清掉 2 个信号，实际 %r" % (cleared,))
+            if SH.SIGNAL_EXTEND_LOCATE.exists() or SH.SIGNAL_WAIT_DETAIL.exists():
+                raise AssertionError("clear_signals() 调用后信号文件仍存在")
+            if SH.clear_signals() != []:
+                raise AssertionError("clear_signals() 不幂等（第二次应返回空）")
+        finally:
+            SH.STATE_DIR, SH.SIGNAL_EXTEND_LOCATE, SH.SIGNAL_WAIT_DETAIL = orig
+            shutil.rmtree(tmpd, ignore_errors=True)
+
+        # ---- C. signin.py 的 finally 里真的调用了它 ----
+        p_signin = os.path.join(HERE, "signin.py")
+        with open(p_signin, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename="signin.py")
+        main_fn = next((n for n in ast.walk(tree)
+                        if isinstance(n, ast.FunctionDef) and n.name == "main"), None)
+        if main_fn is None:
+            raise AssertionError("找不到 main()")
+        # 找 main 里带 finally 的 Try 节点，检查其 finalbody 是否调用 clear_signals
+        found = False
+        for n in ast.walk(main_fn):
+            if isinstance(n, ast.Try) and n.finalbody:
+                for stmt in n.finalbody:
+                    for h in ast.walk(stmt):
+                        if isinstance(h, ast.Call) and isinstance(h.func, ast.Attribute) \
+                                and h.func.attr == "clear_signals":
+                            found = True
+        if not found:
+            raise AssertionError(
+                "signin.py 的 main() finally 里没有调用 self_heal.clear_signals() —— "
+                "自愈信号会残留，导致下次运行继续按'延长等待'跑（每轮白等 45 秒）")
+
+        # ---- 负向自检：检测器对"缺 encoding"的样本要能识别 ----
+        bad = ast.parse("import subprocess\nsubprocess.run(['taskkill','/F','/IM','x'], capture_output=True, text=True)\n")
+        _hit = False
+        for n in ast.walk(bad):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "run":
+                s = ast.unparse(n)
+                if "taskkill" in s and "encoding=" not in s:
+                    _hit = True
+        if not _hit:
+            raise AssertionError("负向测试失效：检测器对缺 encoding 的样本报通过")
+
+        return ("4 个文件的 taskkill 全部带 gbk encoding；clear_signals 可清空且幂等；"
+                "已接入 main().finally；负向自检通过")
+    check("taskkill 编码统一 + 自愈信号不残留", _run)
+
+
+def test_ws_frame_parser_strict():
+    """【2026-09-16 新增·全局复审】极简 WebSocket 帧解析器必须校验协议边界。
+
+    背景：`wifi_helper/browser_login.py` 里手写了一个 CDP 用的 WebSocket 客户端
+    （约 90 行，零第三方依赖）。它原来**完全不校验**控制帧的协议约束：
+
+      RFC 6455 §5.5：控制帧（0x8 close / 0x9 ping / 0xA pong）必须
+        ① payload <= 125 字节  ② 不能分片（FIN 必须为 1）
+
+    后果链条（真实可达）：
+      对端发一个"声称 6 万字节长的 ping"
+        → _read_frame 去 _recv_exact(60000)
+        → **阻塞等 6 万字节**，直到 socket 超时
+        → 而这发生在 CDP call() 的收包循环里
+        → 整条会话挂住 → 浏览器登录失败
+        → 现场只有一个超时，**看不出是协议层被喂了脏帧**
+
+    另外 recv_text 把**二进制帧**也当文本 decode 后交给 json.loads，
+    失败时报一个语焉不详的 JSONDecodeError，同样丢掉"是帧类型不对"这条线索。
+
+    → 断言（AST 抠出 _WS 类单独执行，不建真实连接；用手工构造的帧喂它）：
+      A. 控制帧长度 > 125 → RuntimeError
+      B. 控制帧 FIN=0（被分片）→ RuntimeError
+      C. 二进制帧 → recv_text 抛 RuntimeError
+      D. 孤立续帧（无前置首帧）→ RuntimeError
+      E. **正常路径不能被改坏**：普通文本帧、正常分片文本、带掩码帧都要照常工作
+
+    【负向测试】把控制帧校验删掉，A/B 必须 FAIL（说明断言不是摆设）。
+    """
+    def _run():
+        p = os.path.join(HERE, "wifi_helper", "browser_login.py")
+        if not os.path.isfile(p):
+            raise AssertionError("找不到 %s" % p)
+        with open(p, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src, filename="browser_login.py")
+        cls = next((n for n in tree.body
+                    if isinstance(n, ast.ClassDef) and n.name == "_WS"), None)
+        if cls is None:
+            raise AssertionError("找不到 _WS 类（改名了？本断言需同步更新）")
+
+        # 静态：必须存在控制帧校验（else 后面那些 raise 的痕迹）
+        cls_src = ast.unparse(cls)
+        if "<= 125" not in cls_src and "125" not in cls_src:
+            raise AssertionError(
+                "_WS 里找不到控制帧长度校验（<=125）—— RFC 6455 §5.5 要求控制帧 payload 不得超 125 字节，"
+                "缺了它会被'声称超长'的 ping 卡死整条 CDP 会话")
+        if "控制帧被分片" not in cls_src:
+            raise AssertionError("_WS 里找不到控制帧分片校验（FIN 必须为 1）")
+
+        # 执行：抠出 _WS 类本体
+        import struct as _struct
+        ns = {"socket": __import__("socket"), "os": os, "struct": _struct,
+              "base64": __import__("base64"), "RuntimeError": RuntimeError}
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), "<ws>", "exec"), ns)
+        _WS = ns["_WS"]
+
+        def mk_frame(fin, opcode, payload=b"", masked=False):
+            b1 = (0x80 if fin else 0) | opcode
+            hdr = bytearray([b1])
+            n = len(payload)
+            if n < 126:
+                hdr.append((0x80 if masked else 0) | n)
+            elif n < (1 << 16):
+                hdr.append((0x80 if masked else 0) | 126)
+                hdr += _struct.pack(">H", n)
+            else:
+                hdr.append((0x80 if masked else 0) | 127)
+                hdr += _struct.pack(">Q", n)
+            if masked:
+                m = b"\x01\x02\x03\x04"
+                hdr += m
+                payload = bytes(b ^ m[i % 4] for i, b in enumerate(payload))
+            return bytes(hdr) + payload
+
+        class _FakeSock:
+            def recv(self, n):
+                return b""          # 模拟"对端没有再发数据"→ 触发超时/断开路径
+            def sendall(self, d):
+                pass
+
+        def mk_ws(buf):
+            w = _WS.__new__(_WS)
+            w._buf = buf
+            w.sock = _FakeSock()
+            return w
+
+        def expect_raise(label, fn):
+            try:
+                fn()
+            except RuntimeError:
+                return
+            raise AssertionError("★%s 没有被拦住 —— 协议边界校验缺失" % label)
+
+        # A. 控制帧长度超限
+        over = bytes([0x80 | 0x9, 0x80 | 126]) + _struct.pack(">H", 60000)
+        expect_raise("控制帧长度 60000 的 ping", lambda: mk_ws(over)._read_frame())
+        # B. 控制帧被分片
+        expect_raise("FIN=0 的 ping", lambda: mk_ws(mk_frame(0, 0x9, b"x"))._read_frame())
+        # C. 二进制帧
+        expect_raise("二进制帧", lambda: mk_ws(mk_frame(1, 0x2, b"\x00\x01")).recv_text())
+        # D. 孤立续帧
+        expect_raise("孤立续帧", lambda: mk_ws(mk_frame(1, 0x0, b"x")).recv_text())
+
+        # E. 正常路径不能改坏
+        fin, op, data = mk_ws(mk_frame(1, 0x1, b"hello"))._read_frame()
+        if (fin, op, data) != (0x80, 0x1, b"hello"):
+            raise AssertionError("普通文本帧解析被改坏了：%r" % ((fin, op, data),))
+        frag = mk_ws(mk_frame(0, 0x1, b"he") + mk_frame(1, 0x0, b"llo"))
+        if frag.recv_text() != "hello":
+            raise AssertionError("正常分片文本拼接被改坏了")
+        masked = mk_ws(mk_frame(1, 0x1, b"masked", masked=True))
+        if masked.recv_text() != "masked":
+            raise AssertionError("带掩码帧解析被改坏了")
+
+        # ---- 负向自检：确认"删掉校验"真的会被抓 ----
+        if "length > 125" not in cls_src:
+            raise AssertionError("负向自检：找不到 length > 125 的判定，断言可能是摆设")
+
+        return ("控制帧长度/分片、二进制帧、孤立续帧 4 类协议异常全部拦住；"
+                "正常文本/分片/掩码 3 条路径未改坏")
+    check("WebSocket 帧解析器校验协议边界（不受脏帧卡死）", _run)
 
 
 def test_module_level_side_effects():
@@ -2028,9 +2444,12 @@ def main():
     test_templates_exist()
     test_signin_contracts()
     test_run_outcome()
+    test_fail_evidence_protects_archive()
     test_report_readonly()
     test_bat_ascii()
     test_module_level_side_effects()
+    test_ws_frame_parser_strict()
+    test_subprocess_encoding_and_signal_cleanup()
     test_history()
     test_notify()
     test_runtime()

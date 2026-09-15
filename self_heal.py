@@ -80,10 +80,24 @@ def _save(state):
 
 
 def _kill_process(name):
-    """安全杀进程，返回是否杀到了。"""
+    """安全杀进程，返回是否杀到了。
+
+    【2026-09-16 修复·编码】补 encoding="gbk", errors="ignore"。
+    中文 Windows 上 taskkill 的输出是 GBK，而 text=True 默认按 UTF-8 解码，
+    会**在 subprocess 的 reader 子线程里**抛 UnicodeDecodeError。
+    这个异常不会传到本函数的 `except Exception`（它在另一个线程里），
+    而是被 Python 直接打到 stderr 成一段 traceback。
+
+    危害（实测复现过）：
+      · 每次预热杀进程，stderr 就多两段 traceback；
+      · signin.py 的 run.log **收集 stderr** → 日志被 traceback 淹没，
+        真正的失败信息被埋掉，排查方向被带偏。
+    signin.py 里同类调用（L573/L662/L897）早就加了 encoding，这里是遗漏。
+    """
     try:
         r = subprocess.run(["taskkill", "/F", "/IM", name],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True,
+                           encoding="gbk", errors="ignore", timeout=10)
         return r.returncode == 0
     except Exception:
         return False
@@ -150,6 +164,39 @@ def consume_signal(name):
     except Exception:
         pass
     return False
+
+
+def clear_signals():
+    """【2026-09-16 新增】清掉所有残留的自愈信号。
+
+    为什么需要：信号的语义是"**上次失败后**这一次运行的补偿"。
+    但 consume_signal() 只在流程真正走到那一步时才被调用：
+
+        DETAIL_WAIT = 20 if self_heal.consume_signal("wait_longer_detail") else 12
+        LOCATE_WAIT = 120 if self_heal.consume_signal("extend_locate_wait") else 75
+
+    于是就有了残留窗口（实测确认）：
+        · 上次失败了，preheat 设了 extend_locate_wait
+        · 这次运行因为**已经签到成功 / 不在时段**而快速返回，
+          根本没走到定位步骤 → consume_signal 没被调用
+        · 信号文件留在磁盘上，**下次运行会继续按"延长等待"跑**
+    代价：每轮定位多等 45 秒（120 vs 75），而系统其实早已恢复正常 ——
+    纯属把一次性的补偿变成了永久性的拖慢。
+
+    现在由 signin.py 在收尾（finally）调用一次，无条件清干净。
+    放在收尾而不是开头，是因为开头的 preheat 正要写这些信号 ——
+    在开头清会把刚设的补偿也清掉。
+    """
+    cleared = []
+    for nm, p in (("extend_locate_wait", SIGNAL_EXTEND_LOCATE),
+                  ("wait_longer_detail", SIGNAL_WAIT_DETAIL)):
+        try:
+            if p.exists():
+                p.unlink()
+                cleared.append(nm)
+        except Exception:
+            pass
+    return cleared
 
 
 def record_result(exit_code, failure_step=None, failure_code=None):

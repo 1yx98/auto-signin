@@ -56,7 +56,14 @@ _log_file = None
 # 改为**懒打开 + atexit 兜底**：只有真的要写日志时才建文件，
 # 并且无论怎么退出（正常/异常/SystemExit）都保证 flush + close。
 def _open_log_lazy():
-    """首次写日志时才打开文件（避免 import 即截断上一次的现场）。"""
+    """首次写日志时才打开文件（避免 import 即截断上一次的现场）。
+
+    注意：这里的 open **故意不用 with** —— 它是一个贯穿整个进程生命周期的
+    长命句柄（每次 _log() 都要写），不能一写完就关。收尾交给 atexit 注册的
+    _close_log()。所以扫描"open 没用 with"的静态检查会把这里报出来，
+    那是**已知的、有意的**：判断标准是"句柄会被显式关闭吗"，
+    而不是"字面上有没有 with"。
+    """
     global _log_file
     if _log_file is not None:
         return _log_file

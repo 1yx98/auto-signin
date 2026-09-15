@@ -171,8 +171,27 @@ KEEP_UNKNOWN_DAYS = int(CONFIG.get("keep_unknown_days", 14))
 def _run_outcome(run_dir):
     """判断一次运行的结果：'success' / 'fail' / 'not_time' / 'unknown'。
 
-    优先读 result.txt（收尾时写的，最权威）；读不到就退回看截图文件名。
+    优先读 result.txt（收尾时写的，最权威）；读不到就退回看截图文件名，
+    **再退回读 run.log 的运行总结行**；都判不出来才返回 'unknown'。
     判不出来时**保守当作 fail**——宁可多留一个现场，也不能把真失败当成功清掉。
+
+    【2026-09-16 修复·新的误删链条】第三个来源（run.log）是这一轮补的。
+    为什么必须补：`_prune_old_runs()` 现在把 unknown 按更短的
+    KEEP_UNKNOWN_DAYS(14) 保留（原来和失败一样 90 天）。但 unknown 的成因里
+    有一种**恰恰是"最该保留的失败现场"**：
+
+        磁盘满 / 权限异常
+          → result.txt 写失败（原来是 `except: pass`，静默）
+          → FAIL_*.png 截图也写失败（同一个磁盘满）
+          → _run_outcome 拿到空目录 → 判 'unknown'
+          → 14 天后被删 ← **唯一的失败现场就此蒸发**
+
+    这是"两道防线共享同一个失效原因"的典型：文件系统和截图都依赖"能写盘"，
+    一起坏就一起没了判断依据。而 run.log 是**日志 handler 一直持有句柄**的，
+    写 result.txt 失败时它往往还在（缓冲/已落盘），所以从它里面捞结果最可靠。
+
+    捞法：日志收尾必打一行 `  最终结果=xxx  退出码=n`，用正则取 xxx。
+    这个格式由 main() 的收尾日志保证（见那里注释），是本函数的**契约**。
     """
     # 1) result.txt 最权威
     try:
@@ -194,8 +213,88 @@ def _run_outcome(run_dir):
                 return "success"
     except Exception:
         pass
-    # 3) 判不出来：保守当失败（多留现场，不漏证据）
+    # 3) 【新增】退回读 run.log 的收尾总结行（result.txt 都没写成时的最后凭据）
+    try:
+        lp = os.path.join(run_dir, "run.log")
+        if os.path.isfile(lp):
+            # 只读文件尾部：运行总结在最后，且 run.log 可能几百 KB
+            with open(lp, "r", encoding="utf-8", errors="ignore") as f:
+                try:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - 8192))   # 尾部 8KB 足够覆盖总结段
+                except Exception:
+                    pass
+                tail = f.read()
+            # 取**最后一条**（一轮跑多次时以最终那次为准）
+            hits = re.findall(r"最终结果\s*=\s*([A-Za-z_]+)", tail)
+            if hits:
+                got = hits[-1].strip().lower()
+                # 只认已知取值，避免日志里出现别的 "最终结果=" 被误采
+                if got in ("success", "fail", "not_time", "crash"):
+                    return got
+    except Exception:
+        pass
+    # 4) 【新增】退回读 step_trace.json（机器可读，与上面两条**来源独立**）
+    #    为什么单列一级：上面三条都依赖"文本能被解析出来"，
+    #    而这条读的是结构化 JSON 里的 final_result 字段，连编码猜测都不需要。
+    #    它是 step_tracer 每轮都会 flush 的，强杀前最后一轮通常也已落盘。
+    try:
+        tp = os.path.join(run_dir, "step_trace.json")
+        if os.path.isfile(tp):
+            import json as _json
+            with open(tp, "r", encoding="utf-8", errors="ignore") as f:
+                d = _json.load(f)
+            got = str(d.get("final_result") or "").strip().lower()
+            if got in ("success", "fail", "not_time", "crash"):
+                return got
+    except Exception:
+        pass
+    # 5) 判不出来：保守当失败（多留现场，不漏证据）
     return "unknown"
+
+
+def _has_fail_evidence(run_dir):
+    """【2026-09-16 新增】目录里是否有**实打实的失败痕迹**。
+
+    这是与 _run_outcome 互补的**最后一道冗余**。区别在"看什么"：
+      _run_outcome      → 解析内容（result.txt 文本 / 截图名 / 日志行 / JSON 字段）
+                          依赖"解析得动"：磁盘满写了一半、编码坏了、格式变了，都会失效。
+      _has_fail_evidence → 只看**文件在不在**，不做任何解析。
+                          判据可以失效，但"FAIL_xxx.png 这个文件存在"这个事实不会骗人。
+
+    判据（任一命中即算有失败痕迹）：
+      · 文件名含 FAIL_ / _FAIL_ / EXCEPTION  —— 三个截图命名约定，历史版本都用过
+      · 目录里有 step_trace.json 且能**读**到 final_result 不是 success
+        （读不动就跳过，不当作证据 —— 宁可漏保护，不可误保护）
+
+    用途：`_prune_old_runs()` 里，被判为 unknown 的目录如果**有失败痕迹**，
+    就强制走 90 天的 fail 通道，而不是按 14 天的 unknown 通道清掉。
+    这样即使所有文本判据都失效，"唯一的失败现场"也不会被提前删除。
+
+    注意"宁可漏保护，不可误保护"的方向：本函数只做**加法**（让目录活得更久），
+    所以漏判的代价是"多占一点磁盘"，误判的代价才是"现场没了"。方向上应该偏保守 ——
+    所以只要有一丝痕迹就返回 True。
+    """
+    try:
+        for n in os.listdir(run_dir):
+            if n.startswith("FAIL_") or "_FAIL_" in n or "EXCEPTION" in n:
+                return True
+        # step_trace.json 里明确记着失败，也算证据（哪怕没有任何 FAIL_ 截图）
+        tp = os.path.join(run_dir, "step_trace.json")
+        if os.path.isfile(tp):
+            try:
+                import json as _json
+                with open(tp, "r", encoding="utf-8", errors="ignore") as f:
+                    d = _json.load(f)
+                fr = str(d.get("final_result") or "").strip().lower()
+                if fr in ("fail", "crash"):
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
 
 
 def _prune_warn(msg):
@@ -224,8 +323,8 @@ def _prune_old_runs():
     返回 dict：
       removed / kept        实际删掉、保留的目录数
       fail_kept             保留期内的失败(crash/fail)目录数
-      unknown / unknown_kept / unknown_removed
-                            未判定结果的目录数（总数/保留/删除）
+      unknown / unknown_kept / unknown_removed / unknown_as_fail
+                            未判定结果的目录数（总数/保留/删除/实为失败）
       errors                删除失败的次数（每失败一个 +1）
 
     【2026-09-16 修复·静默吞异常】原实现整体 `except Exception: pass`，
@@ -246,7 +345,8 @@ def _prune_old_runs():
     足够人工回看，又不会长期占坑。
     """
     st = {"removed": 0, "kept": 0, "fail_kept": 0,
-          "unknown": 0, "unknown_kept": 0, "unknown_removed": 0, "errors": 0}
+          "unknown": 0, "unknown_kept": 0, "unknown_removed": 0,
+          "unknown_as_fail": 0, "errors": 0}
     try:
         dirs = sorted([d for d in os.listdir(LOG_DIR)
                        if d.startswith("run_") and os.path.isdir(os.path.join(LOG_DIR, d))], reverse=True)
@@ -271,6 +371,28 @@ def _prune_old_runs():
                     # unknown 是"结果读不出来"，多为强杀产物，也可能是成功的运行
                     # 但 result.txt 没写成。它不值得按 90 天失败期保留（占空间没诊断价值），
                     # 但也不该立刻删（可能包含唯一的现场）。折中用 KEEP_UNKNOWN_DAYS。
+                    #
+                    # 【2026-09-16 再修复·第二道保险】"有证据就不按 unknown 删"。
+                    # 上面给 _run_outcome 补了 run.log 兜底，但兜底也可能失效
+                    # （日志本身没写成 / 格式变了）。这道保险不依赖任何解析：
+                    # 只要目录里**存在真正的失败现场文件**（FAIL_*.png / EXCEPTION*），
+                    # 就说明它是失败、必须走 90 天的 fail 通道 —— 哪怕判据没认出来。
+                    #
+                    # 这是"判据"和"事实"之间的冗余：判据可能坏，事实（文件在不在）不会。
+                    if _has_fail_evidence(os.path.join(LOG_DIR, d)):
+                        if dt < fail_cutoff:
+                            try:
+                                shutil.rmtree(os.path.join(LOG_DIR, d))
+                                st["removed"] += 1
+                                st["unknown_removed"] += 1
+                            except Exception as e:
+                                st["errors"] += 1
+                                _prune_warn("[清理] 删除失败目录 %s 失败: %s" % (d, e))
+                        else:
+                            protected.add(d)
+                            st["fail_kept"] += 1
+                            st["unknown_as_fail"] += 1
+                        continue
                     if dt < unknown_cutoff:
                         try:
                             shutil.rmtree(os.path.join(LOG_DIR, d))
@@ -831,8 +953,18 @@ def kill_wechat():
     for name in ("Weixin.exe", "WeChatAppEx.exe"):
         try:
             # 必须给 timeout：taskkill 偶发卡住会把整个脚本挂到定时任务 30 分钟上限
+            #
+            # 【2026-09-16 修复·编码】补 encoding="gbk", errors="ignore"。
+            # 中文 Windows 上 taskkill 的输出是 GBK 编码，而 text=True 默认按
+            # locale/UTF-8 解码 → **在 subprocess 的 reader 线程里抛
+            # UnicodeDecodeError**，异常不会被这里的 except 抓到
+            # （它在另一个线程里），而是被 Python 打印到 stderr 成一段 traceback。
+            # 后果：run.log 收集 stderr → 每次杀进程都多两段 traceback，
+            # 真正的失败信息被噪音淹没；排查时容易被误导。
+            # 本项目其他地方（L573/L662/L897）**早就加了**这个参数，
+            # 只有这几处漏了 —— 属于一致性缺陷，不是设计如此。
             subprocess.run(["taskkill", "/F", "/T", "/IM", name],
-                           capture_output=True, text=True, timeout=15)
+                           capture_output=True, text=True, encoding="gbk", errors="ignore", timeout=15)
         except Exception as e:
             logger.warning(f"[进程] 结束 {name} 失败(忽略): {e}")
     time.sleep(2)
@@ -1144,7 +1276,7 @@ def reset_old_miniprogram():
     # r.returncode，一旦 taskkill 起不来（异常）就会 NameError 把整轮打挂。
     try:
         r = subprocess.run(["taskkill", "/F", "/T", "/IM", "WeChatAppEx.exe"],
-                           capture_output=True, text=True, timeout=15)
+                           capture_output=True, text=True, encoding="gbk", errors="ignore", timeout=15)
         killed = (r.returncode == 0)
     except Exception as e:
         logger.warning(f"[小程序] 清理小程序引擎进程失败(忽略): {e}")
@@ -2991,8 +3123,14 @@ def clear_foreground_blockers(rounds=4):
         time.sleep(0.6)
         if user32.IsWindow(fg) and user32.GetForegroundWindow() == fg:
             try:
+                # 【2026-09-16 修复·编码】这处尤其要补：下一行会把 stdout/stderr
+                # **直接打进日志**。中文 Windows 上 taskkill 输出 GBK，
+                # 不加 encoding 的话有两重坏结果：
+                #   ① 解码在线程里崩 → stderr 多一段 traceback
+                #   ② 就算没崩，中文提示也会变成乱码写进 run.log
                 p_ = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                                    capture_output=True, text=True, timeout=8)
+                                    capture_output=True, text=True,
+                                    encoding="gbk", errors="ignore", timeout=8)
                 logger.info(f"[清障] taskkill pid={pid} rc={p_.returncode} {p_.stdout.strip()} {p_.stderr.strip()}")
             except Exception as e:
                 logger.warning(f"[清障] taskkill 失败: {e}")
@@ -3408,6 +3546,16 @@ def main():
         log_ocr_stats()
         logger.info("=" * 58)
         # 写 result.txt：一行快速结果，不用翻日志
+        #
+        # 【2026-09-16 修复·静默失败链条】原来这里是 `except Exception: pass`。
+        # 后果链条（已实测确认）：
+        #   result.txt 写失败（磁盘满/权限）
+        #     → _run_outcome() 读不到它，退回看截图名
+        #     → 若截图也写失败（同一个磁盘满）→ 判 'unknown'
+        #     → 归档按更短的保留期被删 → **唯一的失败现场蒸发**
+        # 现在写失败必须出声：这是"事后能不能复盘"的最后一份凭据。
+        # 同时注意上面那行 `最终结果=%s  退出码=%d` 的**格式是 _run_outcome 的契约**，
+        # 第 3 级兜底靠它从 run.log 里捞结果 —— 改格式必须同步改那边的正则。
         try:
             with open(os.path.join(RUN_DIR, "result.txt"), "w", encoding="utf-8") as _rf:
                 _rf.write(f"结果: {result}\n退出码: {code}\n含义: {meaning}\n")
@@ -3415,8 +3563,11 @@ def main():
                 _rf.write(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 for _el, _ev in TIMELINE:
                     _rf.write(f"  {_el:7.1f}  {_ev}\n")
-        except Exception:
-            pass
+        except Exception as _rfe:
+            logger.error("[收尾] 写 result.txt 失败: %s: %s —— "
+                         "这会导致下次清理时判不出本次结果（可能按未判定归档处理）；"
+                         "run.log 里的「最终结果=」行是唯一凭据，请勿删除"
+                         % (type(_rfe).__name__, _rfe))
         # 飞书通知：正常收尾（成功/失败/不在时段都发，失败不影响主流程）
         notify_feishu()
         if result == "success":
@@ -3448,6 +3599,24 @@ def main():
             _guard_clear_in_progress()
         except Exception as _gc:
             logger.warning("[兜底] 清除进行中标记异常（忽略）: %s" % _gc)
+        # 【2026-09-16 修复·信号残留】清掉没用掉的自愈信号。
+        #
+        # 信号的语义是"上次失败后**这一次**运行的补偿"，但 consume_signal()
+        # 只在流程真正走到定位/详情页那两步时才被调用。所以有残留窗口：
+        #   上次失败 → preheat 设了 extend_locate_wait
+        #   → 这次因为"已签到成功/不在时段"快速返回，没走到定位步骤
+        #   → 信号留在盘上 → **下次运行继续按"延长等待"跑**
+        # 代价是每轮定位白等 45 秒（120 vs 75），且会一直延续下去。
+        #
+        # 必须放在 finally（而不是开头）：开头的 preheat 正要写这些信号，
+        # 在开头清会把刚设好的补偿一起清掉。
+        try:
+            _cl = self_heal.clear_signals()
+            if _cl:
+                logger.info("[自愈] 已清理未消费的信号（本次流程未走到对应步骤）: %s"
+                            % ", ".join(_cl))
+        except Exception as _cs:
+            logger.warning("[自愈] 清理残留信号异常（忽略）: %s" % _cs)
         # 取消微信置顶（脚本运行期间可能置顶了微信，结束后恢复正常）
         try:
             for _h, _t in enum_windows(True):

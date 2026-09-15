@@ -126,6 +126,26 @@ class _WS:
             length = struct.unpack(">H", self._recv_exact(2))[0]
         elif length == 127:
             length = struct.unpack(">Q", self._recv_exact(8))[0]
+
+        # 【2026-09-16 加固·控制帧校验】RFC 6455 §5.5：控制帧
+        # （0x8 close / 0x9 ping / 0xA pong）必须满足两条：
+        #   ① payload <= 125 字节
+        #   ② 不能分片（FIN 必须为 1）
+        # 原来完全不校验。后果：若对端发一个"声称 6 万字节长的 ping"，
+        # 下面的 _recv_exact(length) 会阻塞着等 6 万字节，
+        # 直到 socket 超时才抛错 —— 而这里是 CDP 的 call() 循环内部，
+        # 一卡就整条会话挂住，最终表现为"浏览器登录失败"，
+        # 现场只剩一个超时，**看不出是协议层被喂了脏帧**。
+        # 这里主动拒绝，并给出可诊断的报错。
+        if opcode >= 0x8:
+            if length > 125:
+                raise RuntimeError(
+                    "WebSocket 控制帧长度非法（opcode=0x%X length=%d > 125）："
+                    "对端协议异常，主动断开" % (opcode, length))
+            if not fin:
+                raise RuntimeError(
+                    "WebSocket 控制帧被分片（opcode=0x%X）：违反 RFC 6455 §5.5，主动断开" % opcode)
+
         mask = self._recv_exact(4) if masked else None
         data = self._recv_exact(length) if length else b""
         if mask:
@@ -133,8 +153,18 @@ class _WS:
         return fin, opcode, data
 
     def recv_text(self):
-        """收一条完整文本消息（自动处理分片与 ping/pong）。"""
+        """收一条完整文本消息（自动处理分片与 ping/pong）。
+
+        【2026-09-16 加固】原来是"不管 opcode，一律 append data、最后 decode 成 utf-8"。
+        两个隐患：
+          · 收到**二进制帧**（opcode=0x2）时，会被当文本 decode 再交给 json.loads，
+            结果是一个语焉不详的 JSONDecodeError —— 排查时看不出"是帧类型不对"。
+          · 首次分片帧（opcode=0x1）后续续帧（opcode=0x0）之外，
+            出现"两个独立的首帧"这种协议错误也不报错，会被拼接成一段垃圾。
+        现在明确区分，并保留"拼接继续"的宽容行为（DevTools 实际会分片发长 JSON）。
+        """
         chunks = []
+        started = False
         while True:
             fin, opcode, data = self._read_frame()
             if opcode == 0x9:      # ping -> pong
@@ -144,6 +174,17 @@ class _WS:
                 continue
             if opcode == 0x8:      # close
                 raise RuntimeError("WebSocket 已被对端关闭")
+            if opcode == 0x2:      # 二进制帧：CDP 从不用它，收到说明协议异常
+                raise RuntimeError(
+                    "WebSocket 收到二进制帧（长度 %d）—— CDP 只用文本帧，协议异常" % len(data))
+            if opcode == 0x1:      # 新文本消息的首帧
+                if started and chunks:
+                    # 上一个消息还没结束就又来了首帧：协议错误，丢弃残片重新开始
+                    chunks = []
+                started = True
+            elif opcode == 0x0:    # 续帧
+                if not started:
+                    raise RuntimeError("WebSocket 收到孤立续帧（没有前置首帧），协议异常")
             chunks.append(data)
             if fin:
                 return b"".join(chunks).decode("utf-8", errors="replace")
@@ -180,7 +221,23 @@ class _CDP:
         raise TimeoutError(f"CDP {method} 超时")
 
     def drain(self, seconds=3):
-        """收一段时间的事件，不阻塞太久。"""
+        """收一段时间的事件，不阻塞太久。
+
+        【2026-09-16 修复·静默跳出】
+        原来的异常处理是：
+            except socket.timeout: continue    ← 超时，继续收
+            except Exception:      break       ← 其他异常，静默跳出
+        "静默"是真问题：`_read_frame` 现在会为协议异常抛 RuntimeError
+        （脏帧、二进制帧、孤立续帧…），这些都会走 `break` 被**无声吃掉**。
+        调用方看到的现象是"事件少收了几条"，而不是"WebSocket 协议出问题了" ——
+        于是真正的根因被掩盖成"页面加载慢"，排查方向直接跑偏。
+
+        现在把两类分开：
+          · 超时 → 继续收（这是 drain 的正常节奏，不是错误）
+          · 协议/连接错误 → 记下来（self.events 里塞一条诊断事件）并跳出
+            —— 不抛给调用方（drain 本就是"尽力而为"的收事件），
+               但**必须留痕**，让后面的人知道连接是在这一刻坏的。
+        """
         end = time.time() + seconds
         old = self.ws.sock.gettimeout()
         try:
@@ -188,9 +245,17 @@ class _CDP:
             while time.time() < end:
                 try:
                     msg = json.loads(self.ws.recv_text())
-                except socket.timeout:
+                except (socket.timeout, TimeoutError):
                     continue
-                except Exception:
+                except Exception as e:
+                    # 不静默：把"连接为何中断"记成一条事件，供诊断
+                    self.events.append({
+                        "method": "_drain_aborted",
+                        "params": {
+                            "error": "%s: %s" % (type(e).__name__, e),
+                            "at": time.time(),
+                        },
+                    })
                     break
                 if "method" in msg:
                     self.events.append(msg)
@@ -494,9 +559,19 @@ def _close_browser(proc, port, profile, wait=8):
         except Exception:
             pass
         # 3) 硬杀整棵进程树（启动器已退出时这步会失败，忽略即可）
+        #
+        # 【2026-09-16】这里没写 text=True，所以输出保持 bytes、不会触发解码，
+        # 当前是**安全的**。但仍显式加 encoding + text，原因有二：
+        #   ① 一致性：全项目 6 处 taskkill 现在都走同一个模式，
+        #      以后有人照着别处改成 text=True 时不会踩坑；
+        #   ② 防未来变更：一旦有人为了打日志加上 text=True 而忘了 encoding，
+        #      中文 Windows 的 GBK 输出就会在 reader 线程里抛
+        #      UnicodeDecodeError（异常抓不到、只往 stderr 喷 traceback）。
+        #      把它钉死在"带 encoding 的 text 模式"，这个坑就永远踩不到。
         try:
             subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                           capture_output=True, timeout=10)
+                           capture_output=True, text=True,
+                           encoding="gbk", errors="ignore", timeout=10)
         except Exception:
             pass
     # 等浏览器真正退出、profile 锁释放，再交给调用方 rmtree
@@ -679,7 +754,14 @@ if __name__ == "__main__":
         pass
     _cfg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
     try:
-        _c = json.load(open(_cfg, encoding="utf-8"))
+        # 【2026-09-16 修复·句柄泄漏】原来是 `json.load(open(_cfg, ...))` ——
+        # 一行写法看着干净，但文件句柄**永远不会被显式关闭**，
+        # 只能等 GC 回收。在 CPython 上通常没事（引用计数会立刻回收），
+        # 但这是"靠实现细节兜底"：一旦这个模块被别的解释器/嵌入式场景用到，
+        # 或者以后有人加个循环反复读配置，就会攒下句柄。
+        # 用 with 明确释放，零成本。
+        with open(_cfg, encoding="utf-8") as _fh:
+            _c = json.load(_fh)
         _u, _p = _c.get("wifi_username"), _c.get("wifi_password")
     except Exception:
         _u = _p = None
