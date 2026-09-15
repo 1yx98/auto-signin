@@ -329,7 +329,27 @@ def test_signin_contracts():
                 "open_signin_entry() 里出现 %s —— 这是'凭列表颜色直接判签到成功'的假成功路径，"
                 "9-15 已删除。要恢复请先读完那次事故记录：它从未带来收益，却制造了唯一一次假成功。"
                 % ", ".join(bad_returns))
-        return "open_signin_entry 无 'already' 出口"
+        # 2) 【2026-09-15 补】reopen_miniprogram_to_refresh() 也不得返回 "already"。
+        #    它是确认阶段"退出重进刷新状态"的辅助函数，曾经也有一条
+        #    "重进后列表看到绿色就判成功"的返回（证据标记 reopen_list_green）。
+        #    那同属"凭颜色宣布成功"这一类，已一并删除 —— 这条断言防止它被无意中恢复。
+        target2 = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "reopen_miniprogram_to_refresh":
+                target2 = n
+                break
+        if target2 is None:
+            raise AssertionError("找不到 reopen_miniprogram_to_refresh()")
+        bad2 = []
+        for sub in ast.walk(target2):
+            if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Constant):
+                if sub.value.value == "already":
+                    bad2.append("return 'already'")
+        if bad2:
+            raise AssertionError(
+                "reopen_miniprogram_to_refresh() 里出现 %s —— 同样是'凭列表颜色判成功'的假成功路径，"
+                "9-15 已随架构调整删除。" % ", ".join(bad2))
+        return "open_signin_entry / reopen_* 均无 'already' 出口"
     check("架构红线：导航层不得凭颜色判成功", no_color_success_path)
 
     def color_only_logs():
@@ -1172,6 +1192,155 @@ def test_ocr_no_reverse_misread():
     check("OCR 反方向安全：真实「已签到」绝不读成否定词", _run)
 
 
+def test_ocr_best_initialized():
+    """【2026-09-15 新增】ocr_button_text() 里 best 必须在被读取前初始化。
+
+    背景（真实炸过）：原实现只在 `if len(txt) > len(best)` 里给 best 赋值，
+    **从没赋过初值**。真实样本上"完整词"路径总是先命中并 return，
+    把这条残缺分支整个跳过了，所以一直没暴露；但触发路径真实存在
+    （按钮裁偏、主题变化、读到 unrelated 文本就会走进来）。
+
+    后果链条（这是它值得单独一条断言的原因）：
+      ocr_button_text 抛 UnboundLocalError
+        → ocr_veto_signed 的 except 吞掉它并返回 None（放行）
+        → **第三路判据（OCR 否决权）静默失效**
+    而 OCR 是「已签到」vs「已结束」唯一可靠的区分手段 —— 它静默失效 = 假成功风险直线上升。
+    2026-09-15 22:45:26 的 signin_20260915.log 里真的出现过这条异常。
+
+    【为什么用 AST 而不是字符串检查】项目踩过两次同类坑：注释/文档字符串里的
+    函数名或代码片段会让 `"xxx" in src` 类断言误判。凡"检查代码有没有做某件事"，
+    必须查真实语法节点。
+    """
+    def _run():
+        p = os.path.join(HERE, "signin.py")
+        with open(p, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename="signin.py")
+
+        fn = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "ocr_button_text":
+                fn = n
+                break
+        if fn is None:
+            raise AssertionError("找不到 ocr_button_text()")
+
+        # 收集函数体内 best 的赋值行 / 读取行
+        stores, loads = [], []
+        for x in ast.walk(fn):
+            if isinstance(x, ast.Name) and x.id == "best":
+                (stores if isinstance(x.ctx, ast.Store) else loads).append(x.lineno)
+        if not loads:
+            raise AssertionError("ocr_button_text() 里没有读取 best？函数被大改过，请复核本断言")
+        if not stores:
+            raise AssertionError(
+                "ocr_button_text() 里 best **没有任何赋值** —— 读到它就 UnboundLocalError")
+
+        # 关键：必须存在一个"在读取之前"的赋值（初始化）
+        first_load = min(loads)
+        early = [s for s in stores if s < first_load]
+        if not early:
+            raise AssertionError(
+                "ocr_button_text() 里 best 的首次赋值在第 %d 行，但第一次读取在第 %d 行 —— "
+                "**读取发生在赋值之前**，会抛 UnboundLocalError。"
+                "（真实后果：OCR 否决权静默失效，日志只留一行 warning）"
+                % (min(stores), first_load))
+
+        # 再确认：这个初始化是"赋空串/None"这类无副作用初值，不是从别处搬运
+        init_ok = False
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == "best" and node.lineno < first_load:
+                        try:
+                            vals = ast.unparse(node.value)
+                        except Exception:
+                            vals = "?"
+                        if vals in ("''", '""', "None"):
+                            init_ok = True
+        if not init_ok:
+            raise AssertionError(
+                "best 在读取前虽有赋值，但初值不是 '' / \"\" / None —— "
+                "请确认它不依赖任何未定义的东西（本断言只认最稳妥的空初值）")
+        return "best 在第 %d 行初始化，首次读取在第 %d 行（AST 实测）" % (min(early), first_load)
+    check("OCR: ocr_button_text() 的 best 在使用前已初始化", _run)
+
+
+def test_ocr_negative_stems_veto():
+    """【2026-09-15 新增】OCR 读到否定词的"骨架"也必须否决（防假成功漏洞）。
+
+    背景（修复前是真实漏洞）：OCR 常把词读残。若「已结束」被读成「结束」（首字被切掉），
+    原判据 `"已结束" in "结束"` 为 **False**（子串方向反了）
+    → ocr_veto_signed 判 None（放行）→ **读到"结束"却不否决 = 假成功漏网**。
+    而 ocr_button_text 那边的关键词表里恰好有 "结束"，会提前 return 这个残缺结果，
+    所以这条路径是能真实走到的。
+
+    修复：加 _OCR_NEGATIVE_STEMS 骨架词表，并优先做双向匹配。
+    本断言锁死两个方向：
+      · 「结束」/「过期」 这类骨架**必须**被否决（安全方向）
+      · 「已签到」/「已签至刂」**绝不能**被骨架词误伤（反方向，危害更大）
+    """
+    def _run():
+        p = os.path.join(HERE, "signin.py")
+        with open(p, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src, filename="signin.py")
+
+        # AST 抠出三个词表（不用字符串正则，避免被注释骗）
+        tables = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id.startswith("_OCR_"):
+                        try:
+                            tables[t.id] = ast.literal_eval(node.value)
+                        except Exception:
+                            pass
+        for need in ("_OCR_NEGATIVE", "_OCR_NEGATIVE_STEMS"):
+            if need not in tables:
+                raise AssertionError("找不到词表 %s" % need)
+        neg = tables["_OCR_NEGATIVE"]
+        stems = tables["_OCR_NEGATIVE_STEMS"]
+
+        # 复刻 ocr_veto_signed 的判据（只判文本，不碰引擎）
+        def verdict(txt):
+            for w in neg:
+                if w in txt:
+                    return False
+            for st in stems:
+                if st in txt:
+                    return False
+            if "已签到" in txt or "已签 到" in txt or "已签至刂" in txt:
+                return True
+            return None
+
+        # A) 安全方向：这些残缺形态必须被否决
+        must_veto = ["结束", "已结束", "过期", "已过期", "未开始",
+                     "签到未开始", "不在区域内", "未在区域"]
+        missed = [t for t in must_veto if verdict(t) is not False]
+        if missed:
+            raise AssertionError(
+                "这些读到后**必须否决**的文本没有被否决（假成功漏网风险）：%s\n"
+                "      → 请检查 _OCR_NEGATIVE_STEMS 是否覆盖了它们" % missed)
+
+        # B) 反方向（危害更大）：绝不能把正向词误判成否决
+        must_pass = ["已签到", "已签至刂", "已签 到"]
+        wrong = [t for t in must_pass if verdict(t) is False]
+        if wrong:
+            raise AssertionError(
+                "！！反方向误判：正向词被否决了 %s ！！\n"
+                "      → 这会把真实签到判成未签（多跑一轮，甚至漏报成功）" % wrong)
+
+        # C) 骨架词不能宽到把无关文本也否决 —— 至少要放过真正的"不认识"
+        for t in ("已", "已纟", "签", "已签", "Q搜索拼21：06口的劬80％"):
+            if verdict(t) is False:
+                raise AssertionError(
+                    "骨架词过宽：无关文本「%s」被误否决了，会无谓地推翻真实签到" % t)
+
+        return "%d 个否决词 + %d 个骨架词：安全方向全否决、反方向零误伤（AST 实测）" % (
+            len(neg), len(stems))
+    check("OCR: 否定词残缺形态（骨架）也能否决，且不误伤正向词", _run)
+
+
 def _find_gray_bar(img, btn_aspect_min=4.0, btn_aspect_max=14.0):
     """在整图里兜底找"灰色按钮"（当项目扫描逻辑因窗口尺寸假设不匹配而失败时用）。
     返回 list[dict]，格式同 scan_buttons 的输出。
@@ -1278,6 +1447,8 @@ def main():
     test_runtime()
     test_ocr_real_samples()
     test_ocr_no_reverse_misread()
+    test_ocr_best_initialized()
+    test_ocr_negative_stems_veto()
 
     print("\n" + "=" * 60)
     print("通过 %d 项，失败 %d 项" % (len(PASSED), len(FAILED)))

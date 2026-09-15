@@ -1778,12 +1778,32 @@ def open_signin_entry():
 
 _OCR_ENGINE = None
 _OCR_FAILED = False      # 引擎初始化失败后置位，后续不再重试（避免每轮白等）
-_OCR_STATS = {"calls": 0, "veto": 0, "pass": 0, "unknown": 0}
+# 【2026-09-15 新增 errors】原来只有 calls/veto/pass/unknown 四项，且**从不输出**。
+# 结果是"OCR 这层防线到底否决了几次、放行了几次、崩了几次"完全不可观测 ——
+# 而它恰恰是"已签到 vs 已结束"唯一可靠的区分手段，一旦静默失效没人会发现。
+# 现在 errors 单独计数，并在收尾统一输出（见 log_ocr_stats）。
+_OCR_STATS = {"calls": 0, "veto": 0, "pass": 0, "unknown": 0, "errors": 0}
 
 # 出现这些词 → 明确不是"今天已签到"（历史记录 / 未开放）
 _OCR_NEGATIVE = ("已结束", "已过期", "未开始", "不在区域内", "未在区域", "签到未开始")
+# 【2026-09-15 新增·防假成功漏洞】否定词被 OCR 读残后的"骨架"。
+# 为什么必须有它：OCR 常把词读残（实测见过「已」、「已纟」）。
+# 关键的是 —— 若「已结束」被读成「结束」（首字被切掉），原来的判断是：
+#     "已结束" in "结束"  →  False   （子串方向反了）
+# 于是 ocr_button_text 会因为关键词"结束"命中而**提前 return「结束」**，
+# 但 ocr_veto_signed 又不认识它 → 判 None（不否决）→ **假成功漏网**。
+# 这正是本项目最需要防的方向：读到"结束"却不否决。
+# 这些骨架词只要出现，就说明按钮**更像**「已结束」而不是「已签到」，
+# 按"宁可多跑一轮、绝不假成功"的原则一律否决。
+_OCR_NEGATIVE_STEMS = ("结束", "过期", "未开始", "不在区域", "未在区域", "在区域内")
 # 读到其中任意一个 → 认为"这一档放大倍数读到了有用的东西"，可早退（不必再试下一档）
 _OCR_KEYWORDS = ("签到", "结束", "区域", "开始", "已签")
+# 【2026-09-15 新增】"完整判定词"——读到它就可以收工，因为再读也只是重复。
+# 为什么要把完整词和骨架词分开：骨架词（"结束"/"开始"/"区域"）可能是完整词被读残的产物
+# （「已结束」→「结束」），早早 return 会把后面**更完整的**读法丢掉。
+# 目标词优先，才能让防假成功最需要的那两个词（已签到 / 已结束）尽量完整地读出来。
+_OCR_FULL_WORDS = ("已签到", "已签至刂", "已签 到",
+                   "已结束", "已过期", "签到未开始", "不在区域内", "未在区域")
 
 def _ocr_get_engine():
     """惰性初始化 Windows 内置 OCR 引擎。不可用时返回 None 并记住失败。"""
@@ -1935,6 +1955,15 @@ def ocr_button_text(full, btn, scales=(10, 8, 6, 12, 4, 5, 4, 3, 2), pads=(0, -1
         # 残缺片段对否决判据毫无价值 —— 「已」既不是「已签到」也不是「已结束」，
         # 拿它做判断等于瞎猜。所以先扫描到一个完整词就立刻返回；
         # 只有整轮都没扫到完整词时，才退回返回残缺片段（聊胜于无，供日志排查）。
+        # 【2026-09-15 修复·崩溃】best 必须在使用前初始化。
+        # 原实现只在 "if len(txt) > len(best)" 里赋值，**从没赋过初值** ——
+        # 一旦第一次走进这个分支就是 UnboundLocalError。当时之所以没暴露：
+        # 真实样本上"完整词"路径总是先命中并 return，把残缺分支整个跳过了。
+        # 但触发路径是真实存在的（按钮裁偏一点、主题一换、读到 unrelated 文本就会走进来），
+        # 后果：ocr_button_text 抛异常 → ocr_veto_signed 的 except 把它吞掉并返回 None
+        # → **第三路判据（OCR 否决权）静默失效**，而且日志只留一行 DEBUG 级别，
+        # 平时根本看不见（2026-09-15 22:45:26 的 signin_20260915.log 里真的发生过）。
+        best = ""
         for pad in pads:
             x0 = max(0, bx - pad); y0 = max(0, by - pad)
             x1 = min(W, bx + bw + pad); y1 = min(H, by + bh + pad)
@@ -1957,17 +1986,58 @@ def ocr_button_text(full, btn, scales=(10, 8, 6, 12, 4, 5, 4, 3, 2), pads=(0, -1
                     txt = _ocr_read(eng, big)
                     if not txt:
                         continue
-                    # A) 完整词（命中关键词）→ 立刻收工
-                    if any(k in txt for k in _OCR_KEYWORDS):
+                    # A) 【2026-09-15 修复·早退太早】优先"更完整的判定词"。
+                    #    原来的判据是 any(k in txt for k in _OCR_KEYWORDS) 就立刻 return，
+                    #    而 _OCR_KEYWORDS 里既有完整词（"签到"）也有骨架（"结束"/"开始"/"区域"）。
+                    #    后果：只要某一档读出「结束」（「已结束」被切掉首字的残缺形态），
+                    #    就**立刻收工**，把后面可能读出的完整「已结束」白白丢掉 ——
+                    #    而「已结束」正是防假成功最需要读到的词。
+                    #    现在改成：优先返回完整词；骨架词只做候选，继续扫更完整的。
+                    if any(k in txt for k in _OCR_FULL_WORDS):
+                        # 完整词已是最好结果：直接返回它（不再被残缺文本干扰）
                         return txt
-                    # B) 残缺片段 → 只记录"最长的那个"，不返回，继续找完整词
+                    if any(k in txt for k in _OCR_KEYWORDS):
+                        # 骨架词：记为候选，但**继续找更完整的**（不 return）
+                        if len(txt) > len(best):
+                            best = txt
+                        continue
+                    # B) 都不是 → 只记录"最长的那个"，继续找
                     if len(txt) > len(best):
                         best = txt
-        # 整轮都没读到完整词：退回最长的残缺片段（可能是'已签'这类部分命中）
+        # 整轮都没读到完整词：退回最长的那条（可能是'已签'这类部分命中，仅供日志排查）
         return best
     except Exception as e:
-        logger.debug(f"[OCR] 单次识别失败（不否决，按'未知'处理）：{e}")
+        # 【2026-09-15 修复·失败被掩盖】这里原来是 logger.debug。
+        # 后果是：OCR 判据整条路径失效时（例如上面那个 best 未初始化的 UnboundLocalError），
+        # 按天日志 signin_YYYYMMDD.log 里**什么都看不到** —— 而按天日志才是"过几天回头看
+        # 当时到底发生了什么"的唯一凭据（run_* 目录会被清理）。
+        # 判据类异常必须升级到 warning：它不影响签到主流程，但必须让人能发现"这层防线没在工作"。
+        _OCR_STATS["errors"] += 1
+        logger.warning(f"[OCR] 单次识别异常（不否决，按'未知'处理；累计 {_OCR_STATS['errors']} 次）：{e}")
         return ""
+
+
+def log_ocr_stats():
+    """收尾时输出本次运行 OCR 判据的"工作台账"（纯观察，不参与任何决策）。
+
+    【为什么需要】OCR 是"已签到 vs 已结束"唯一可靠的区分手段（两者像素形态相同），
+    但它的工作效果此前**完全不可观测**：_OCR_STATS 只累加、从不打印。
+    于是"这道防线今天其实一次都没生效"这种事，只能靠翻源码和猜。
+    现在每次收尾打一行，一眼就能看出它到底有没有在工作：
+      · calls=0        → 本次根本没走到需要它复核的判定（正常：没签到成功就不复核）
+      · errors>0       → 它抛异常了，必须查（判据静默失效）
+      · veto>0         → 它成功拦下了一次假成功（这正是我们要的效果）
+    任何异常都吞掉：这是观察代码，绝不能反过来影响签到。"""
+    try:
+        s = _OCR_STATS
+        logger.info("[OCR统计] 本次运行：复核 %d 次 | 否决 %d | 确认已签 %d | 读不出/不表态 %d | 内部异常 %d"
+                    % (s.get("calls", 0), s.get("veto", 0), s.get("pass", 0),
+                       s.get("unknown", 0), s.get("errors", 0)))
+        if s.get("errors", 0) > 0:
+            logger.warning("[OCR统计] 本次 OCR 出现过 %d 次内部异常 —— 第三路判据（否决权）"
+                           "在这些时刻是失效的，请查上面的 [OCR] 异常行" % s["errors"])
+    except Exception:
+        pass
 
 
 def ocr_veto_signed(full, btn, tag=""):
@@ -1992,13 +2062,27 @@ def ocr_veto_signed(full, btn, tag=""):
             logger.info(f"[OCR] {tag}按钮文字读不出（不否决，交给其他判据）")
             return None
         # 1) 否定词优先（安全方向：宁可判否）
+        #    两轮匹配：
+        #      a) 完整否定词出现在读到的文本里（正常情形）
+        #      b) 否定词的"骨架"出现在文本里（OCR 把首字读残，例如「已结束」→「结束」）
+        #    (b) 是 2026-09-15 补的假成功漏洞：原实现只做 (a)，
+        #    而 ocr_button_text 会在关键词"结束"命中时提前 return「结束」，
+        #    此时 "已结束" in "结束" 为 False → 判 None 不否决 → 漏掉假成功。
         for w in _OCR_NEGATIVE:
             if w in txt:
                 _OCR_STATS["veto"] += 1
                 logger.warning(f"[OCR] {tag}按钮文字=「{txt}」含否定词「{w}」→ **否决**'已签到'判定"
                                f"（这是防假成功的关键一步）")
                 return False
-        # 2) 正向词
+        for st in _OCR_NEGATIVE_STEMS:
+            if st in txt:
+                _OCR_STATS["veto"] += 1
+                logger.warning(f"[OCR] {tag}按钮文字=「{txt}」含否定词骨架「{st}」→ **否决**'已签到'判定"
+                               f"（OCR 读残了，但方向明确是历史/未开放记录，宁可多跑一轮也不假成功）")
+                return False
+        # 2) 正向词：必须是**完整**的「已签到」才认（含实测见过的残缺变体）。
+        #    刻意不接受单个「已」或「签」——它们既可能来自「已签到」也可能来自「已结束」，
+        #    拿它们当正向证据等于瞎猜（同样的理由也写在 ocr_button_text 的注释里）。
         if "已签到" in txt or "已签 到" in txt or "已签至刂" in txt:
             _OCR_STATS["pass"] += 1
             logger.info(f"[OCR] {tag}按钮文字=「{txt}」确认为「已签到」（正向证据）")
@@ -2315,9 +2399,11 @@ def reopen_miniprogram_to_refresh():
     if _re == "not_time":
         logger.info("[刷新] 重进后签到未开始（不在时段）")
         return "not_time"
-    if _re == "already":
-        logger.info("[刷新] 重进后列表第一张卡片已显示绿色'已签到'，刷新成功")
-        return "already"
+    # 【2026-09-15 清理】这里原来还有一支 `if _re == "already": return "already"`，
+    # 是"列表看到绿色就判成功"那条短路路径的残留。该路径已在架构调整中彻底移除
+    # （open_signin_entry 不再返回 "already"），所以这支成了**永远走不到的死代码**。
+    # 留着它的危害：让调用方（click_sign_button 的确认阶段）误以为"重进后可能直接拿到结论"，
+    # 从而保留了一个本不该存在的成功出口。已删除，成功与否一律走详情页硬确认。
     logger.info("[刷新] 已重新进入油学通并到达签到详情页")
     return True
 
@@ -2539,13 +2625,13 @@ def click_sign_button():
                     logger.info("[确认] 连续3次刷新未见到'已签到'，退出小程序重新进入以刷新服务器状态")
                     reentered = True
                     _re = reopen_miniprogram_to_refresh()
-                    if _re == "already":
-                        evi = shot("签到成功_重进列表已签")
-                        mark("重进后列表第一张卡片绿色'已签到'，证据截图=%s" % os.path.basename(evi))
-                        logger.info("[结果] 重进后列表已显示绿色'已签到'（服务器状态），判定签到成功")
-                        TRACE.signal("evidence", "reopen_list_green")
-                        TRACE.end_step("success")
-                        return "success"
+                    # 【2026-09-15 清理】这里原来还有一支 `if _re == "already"`：
+                    # 那是"重进后列表看到绿色就判成功"的出口（证据标记 reopen_list_green）。
+                    # 它随架构调整一起废掉了 —— reopen_miniprogram_to_refresh 已不再返回
+                    # "already"（见该函数注释），所以这支是走不到的死代码。
+                    # 删它的意义不只是清洁：**它是一整类"凭颜色宣布成功"路径的最后残留**，
+                    # 留着就等于给假成功留了一个理论上的后门。
+                    # 现在成功只可能来自下面 while 循环里的"详情页连续 2 次灰色'已签到'"。
                     if _re == "not_time":
                         logger.info("[确认] 重进后签到未开始（不在时段），返回 not_time")
                         TRACE.end_step("not_time", "REOPEN_NOT_TIME")
@@ -2723,8 +2809,10 @@ _FEISHU_DONE = [False]
 
 # 【2026-09-15】给 atexit 中断兜底用的全局进度标记：
 # click_sign_button() 每点一次"完成签到"就累加，进程被强杀时据此判断
-# "是否值得补一条结果未知的提醒"。用 list 包一层是为了在嵌套函数里能就地改。
-_GUARD = {"finish_clicks": 0, "detail_seen": False}
+# "是否值得补一条结果未知的提醒"。用 dict 是为了在嵌套函数里能就地改。
+# 注意：原来还有个 "detail_seen" 字段，定义了却从没被读过/写过（死字段），
+# 2026-09-15 已删 —— 留着会让人误以为"中断兜底还会参考是否到过详情页"。
+_GUARD = {"finish_clicks": 0}
 
 def _within_signin_window():
     """当前是否还在签到时间窗内（用于决定要不要跑第三轮补救）。
@@ -2912,6 +3000,7 @@ def main():
         logger.info("  ---- 关键时间线（秒: 事件）----")
         for _el, _ev in TIMELINE:
             logger.info("    %7.1f  %s" % (_el, _ev))
+        log_ocr_stats()
         logger.info("=" * 58)
         # 写 result.txt：一行快速结果，不用翻日志
         try:
