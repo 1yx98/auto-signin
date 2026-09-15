@@ -34,6 +34,14 @@ from PIL import ImageGrab
 import step_tracer
 import self_heal
 
+# 签到历史台账（纯新增，零副作用）：每次运行追加一行到 data/signin_history.csv。
+# 导入失败时置 None，主流程所有调用点都要判空——台账绝不能反过来影响签到。
+try:
+    import history as signin_history
+except Exception as _he:
+    signin_history = None
+    logging.getLogger().warning("history 导入失败（忽略，仅少写台账）: %s" % _he)
+
 # 飞书通知模块（独立文件夹 notify_helper/，失败不影响签到主流程）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "notify_helper"))
 try:
@@ -2140,6 +2148,39 @@ def attempt_once(rnd, total_rounds):
 # 一次运行只推一条飞书：异常路径可能重复调用，用这个标记兜住
 _FEISHU_DONE = [False]
 
+def _within_signin_window():
+    """当前是否还在签到时间窗内（用于决定要不要跑第三轮补救）。
+
+    时间配置写坏/缺失时保守返回 True——宁可多跑一轮，也不要因为配置读不出来就放弃补救。
+    """
+    try:
+        hh1, mm1 = [int(x) for x in str(SIGNIN_TIME_START).split(":")]
+        hh2, mm2 = [int(x) for x in str(SIGNIN_TIME_END).split(":")]
+        now = datetime.now().hour * 60 + datetime.now().minute
+        return hh1 * 60 + mm1 <= now <= hh2 * 60 + mm2
+    except Exception:
+        return True
+
+
+def notify_start():
+    """开跑时推一条"开始签到"（第 4 项：让"它到底跑没跑"不再靠猜）。
+
+    与 notify_feishu 分开：这条是"开始"、那条是"结果"，各自独立发。
+    not_time 等提前退出情况不会有结果，最坏就是多一条开始通知，无副作用。
+    """
+    if feishu_notify is None:
+        return
+    try:
+        feishu_notify.send(
+            "油学通签到：开始执行 · %s" % datetime.now().strftime("%m-%d %H:%M"),
+            ["🟦 已启动，正在自动打开微信并搜索「%s」" % SEARCH_KEYWORD,
+             "若无后续结果通知，说明流程卡住（全局超时 %d 秒）" % GLOBAL_TIMEOUT],
+            "info")
+        logger.info("[通知] 已推送开始提醒")
+    except Exception as _se:
+        logger.warning(f"[通知] 开始提醒发送异常（忽略）: {_se}")
+
+
 def notify_feishu(reason=None):
     """把本次签到结果推飞书（成功 / 失败 / 不在时段 / 流程提前中断都会推）。
 
@@ -2180,6 +2221,7 @@ def main():
     log_startup_banner(); mark("脚本启动")
     result = "fail"  # 提前初始化，finally 块引用时不会 NameError
     code = 1         # 同上：提前初始化，finally 里的 step_trace / 自愈都要用真实退出码
+    notify_start()   # 开跑先推一条，让"它到底跑没跑"不用靠猜
     try:
         # 0. 运行全程阻止睡眠/熄屏；清除劫持前台的第三方幽灵弹窗（联想电脑管家等）
         keep_awake()
@@ -2230,8 +2272,9 @@ def main():
             if not start_wechat():
                 notify_feishu("微信启动失败，签到无法开始（详见 run.log 的 [进程] 行）")
                 return 1
-        # 2. 最多完整走两轮：第一轮没确认到'已签到'就冷启动小程序重走一遍，两轮都失败才判失败
-        MAX_ROUNDS = 2
+        # 2. 最多完整走三轮：前两轮间隔 8 秒；若仍未确认且时间窗还有余量，再补第三轮
+        #    （时间窗 20:50-21:30 共 40 分钟，两轮约 6~8 分钟，第三轮放得下）
+        MAX_ROUNDS = 3
         for rnd in range(1, MAX_ROUNDS + 1):
             # 全局超时保护：防止任何阶段卡死导致脚本无限运行
             if time.time() - T0 > GLOBAL_TIMEOUT:
@@ -2255,8 +2298,16 @@ def main():
                 logger.warning("未到签到时段/任务已结束，重试无意义，直接结束")
                 break
             if rnd < MAX_ROUNDS:
-                logger.warning(f"第{rnd}轮未能确认'已签到'，8 秒后冷启动小程序、完整重走一遍（第{rnd+1}轮）")
-                time.sleep(8)
+                # 第三轮是"补救轮"：先冷静 90 秒，且只在时间窗内才跑——
+                # 过了 SIGNIN_TIME_END 再点也没意义，不如早点收工发失败通知。
+                wait_s = 8 if rnd < MAX_ROUNDS - 1 else 90
+                if rnd == MAX_ROUNDS - 1 and not _within_signin_window():
+                    logger.warning(f"第{rnd}轮未成功，但已超出签到时间窗({SIGNIN_TIME_START}-{SIGNIN_TIME_END})，"
+                                   "放弃第三轮补救（补了也点不动）")
+                    break
+                logger.warning(f"第{rnd}轮未能确认'已签到'，{wait_s} 秒后冷启动小程序、完整重走一遍"
+                               f"（第{rnd+1}/{MAX_ROUNDS}轮）")
+                time.sleep(wait_s)
         code = {"success": 0, "not_time": 3}.get(result, 1)
         meaning = {"success": "签到成功（已亲眼见到灰色'已签到'）",
                    "not_time": "不在签到时段/任务已结束（并非失败）"}.get(
@@ -2323,9 +2374,12 @@ def main():
         except Exception:
             pass
         # 自愈：记录本次结果（not_time 不算失败，不触发预热）
+        # _fstep/_fcode 先在上层初始化：下面 try 里任何一步抛错都能被捕获，
+        # 但捕获后变量就没了，后面的台账写入会 NameError（被吞掉→台账静默丢失）。
+        _fstep = None
+        _fcode = None
         try:
             _ec = code
-            _fstep = None; _fcode = None
             if _ec not in (0, 3):
                 # 只有真正失败（1=两轮未确认 / 2=脚本异常）才从 step_trace 提取失败步骤
                 import json as _json
@@ -2344,6 +2398,21 @@ def main():
             _hmsg = self_heal.record_result(_ec, _fstep, _fcode)
             if _hmsg:
                 logger.info(_hmsg)
+        except Exception:
+            pass
+        # 台账：把这次的成败写进 data/signin_history.csv（纯新增，失败静默）。
+        # 要在 finally 里写而不是收尾处写——异常路径（如抛错退出）同样要留痕，
+        # 否则"漏签"最容易漏记的恰恰是异常那几次。
+        try:
+            if signin_history is not None:
+                _row = signin_history.append_record(
+                    result=result, code=code, cost_sec=time.time() - T0,
+                    start_ts=T0, end_ts=time.time(),
+                    fail_step=_fstep, fail_code=_fcode,
+                    run_dir=os.path.basename(RUN_DIR))
+                if _row:
+                    logger.info("[台账] 已记录：%s %s → %s"
+                                % (_row.get("date"), _row.get("time"), result))
         except Exception:
             pass
 

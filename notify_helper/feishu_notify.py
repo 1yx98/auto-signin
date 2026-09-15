@@ -56,6 +56,15 @@ LOG_PATH = os.path.join(HERE, "last_notify.log")
 # 签到系统的根目录（logs/ 在它下面）
 ROOT = os.path.dirname(HERE)
 
+# 历史台账（根目录的 history.py）。只用于在通知里附一句"近 N 天"统计，
+# 导入失败或统计异常一律降级为不显示，绝不阻断通知。
+try:
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    import history as _history
+except Exception:
+    _history = None
+
 API_BASE = "https://open.feishu.cn/open-apis"
 REQ_TIMEOUT = 20
 
@@ -331,6 +340,19 @@ def read_run_summary(run_dir=None):
     return out
 
 
+def should_escalate():
+    """是否需要升级告警（连续失败 ≥2 天 或 近 7 天失败 ≥3 次）。
+
+    读不到台账就返回 False——宁可少告警，也不能因为统计模块出问题就误报。
+    """
+    try:
+        if _history is None:
+            return False, {}
+        return _history.should_escalate(7)
+    except Exception:
+        return False, {}
+
+
 def notify_signin_result(run_dir=None, extra_lines=None, dry_run=False):
     """读最近一次（或指定）签到结果，推送到飞书。"""
     s = read_run_summary(run_dir)
@@ -343,6 +365,15 @@ def notify_signin_result(run_dir=None, extra_lines=None, dry_run=False):
         title, level, icon = "油学通签到失败", "fail", "❌"
     else:
         title, level, icon = "油学通签到：没读到结果", "warning", "⚠️"
+
+    # 连续失败升级：单次失败可能只是偶然，连续失败才是真出问题了。
+    # 只在"本次也失败"时升级配色与标题，成功不会被历史拖累成红色。
+    esc = False
+    if result and result != "success":
+        esc, _st = should_escalate()
+        if esc:
+            level = "fail"
+            title = "油学通签到：连续失败！"
 
     lines = ["%s **%s**" % (icon, (s.get("meaning") or result or "无结果说明"))]
     meta = []
@@ -360,8 +391,18 @@ def notify_signin_result(run_dir=None, extra_lines=None, dry_run=False):
         lines.append("现场截图：%s" % "、".join(s["screenshots"][:3]))
     if s.get("run_dir"):
         lines.append("目录：`%s`" % os.path.basename(s["run_dir"]))
+    # 历史统计：让"这学期漏了几次"不用翻日志
+    try:
+        if _history is not None:
+            _desc = _history.stats(7).get("streak_desc")
+            if _desc:
+                lines.append("📊 %s" % _desc)
+    except Exception:
+        pass
     if extra_lines:
         lines.extend(extra_lines)
+    if esc:
+        lines.append("⚠️ **需要人工检查**：设置「离开后要求登录」是否放宽、WiFi 是否连接、微信是否已登录")
     return send("%s · %s" % (title, time.strftime("%m-%d %H:%M")), lines, level, dry_run=dry_run)
 
 

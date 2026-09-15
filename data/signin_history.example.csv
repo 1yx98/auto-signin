@@ -1,0 +1,6 @@
+﻿date,time,result,code,weekday,cost_sec,start_ts,end_ts,fail_step,fail_code,run_dir,note
+2026-09-09,20:52:31,success,0,三,118.4,,,,,run_20260909_205012,
+2026-09-10,20:51:07,success,0,四,121.0,,,,,run_20260910_205012,
+2026-09-11,21:03:44,fail,1,五,612.8,,,step_4,MATCH_TIMEOUT,run_20260911_205012,被窗口遮挡
+2026-09-12,20:53:15,success,0,六,119.6,,,,,run_20260912_205012,
+2026-09-13,20:55:02,not_time,3,日,45.2,,,,,run_20260913_205012,
