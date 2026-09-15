@@ -115,23 +115,36 @@ def stats(days=7, base_dir=None):
 
     返回 dict：
       total / success / fail / not_time / other
-      fail_streak  连续失败天数（从今天往前数，遇到成功或不在时段即停止计数）
-      streak_desc  连续失败的文字描述，如 "近 7 天失败 3 次、连续 2 天"
+      fail_streak  连续失败天数（从今天往前数，遇到非 fail 即停）
+      streak_desc  连续失败的文字描述，如 "近 7 天：成功 5、失败 2；成功率 71%"
       success_rate 成功率（按"有明确结果的天数"算，not_time 不计入分母）
+
+    同一天多次运行的合并取向（重要）：
+      success > fail > crash > not_time
+      ——出现过成功 → 当天算成功（重试成功不该记成失败）
+      ——否则出现过失败 → 当天算失败（哪怕最后变成 not_time，问题也已发生）
+      ——再否则才算 not_time
+      这个顺序保证"那天其实反复失败过"不会被后来的 not_time 掩盖掉。
     """
     out = {"total": 0, "success": 0, "fail": 0, "not_time": 0, "other": 0,
            "fail_streak": 0, "streak_desc": "", "success_rate": None, "days": days}
     try:
         recs = recent_records(days, base_dir)
         out["total"] = len(recs)
-        # 同一天多次运行：以当天"最好"的结果为准（成功优先），避免重试把成功率拉低
+        # 同一天多次运行：以当天"最好"的结果为准，避免重试把成功率拉低。
+        # 但 rank 的排序有个关键取向——**遇到问题要暴露，不能掩盖**：
+        #   success(3) > not_time(2) > fail(1) > crash(0) 是错的，会让
+        #   "先失败几次、最后不在时段"这种一天被判成"不在时段"，把失败藏起来。
+        # 正确取向：只要当天**出现过成功**就算成功（重试成功不该记成失败）；
+        #   否则只要有**失败**就算失败（哪怕后来变成 not_time，问题也已发生）；
+        #   再否则才算 not_time。
+        _rank = {"success": 3, "fail": 2, "crash": 1, "not_time": 0}
         by_day = {}
         for r in recs:
             d = r.get("date") or ""
             res = (r.get("result") or "").strip()
             prev = by_day.get(d)
-            rank = {"success": 3, "not_time": 2, "fail": 1, "crash": 0}
-            if prev is None or rank.get(res, 0) > rank.get(prev, 0):
+            if prev is None or _rank.get(res, 0) > _rank.get(prev, 0):
                 by_day[d] = res
         for res in by_day.values():
             if res == "success":

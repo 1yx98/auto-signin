@@ -391,12 +391,15 @@ def notify_signin_result(run_dir=None, extra_lines=None, dry_run=False):
         lines.append("现场截图：%s" % "、".join(s["screenshots"][:3]))
     if s.get("run_dir"):
         lines.append("目录：`%s`" % os.path.basename(s["run_dir"]))
-    # 历史统计：让"这学期漏了几次"不用翻日志
+    # 历史统计：让"这学期漏了几次"不用翻日志。
+    # 台账为空（首次使用/还没记录）时不显示——否则"成功 0、失败 0"看着像出问题了。
     try:
         if _history is not None:
-            _desc = _history.stats(7).get("streak_desc")
-            if _desc:
-                lines.append("📊 %s" % _desc)
+            _st = _history.stats(7)
+            if _st.get("total"):
+                _desc = _st.get("streak_desc")
+                if _desc:
+                    lines.append("📊 %s" % _desc)
     except Exception:
         pass
     if extra_lines:
