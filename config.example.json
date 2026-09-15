@@ -1,48 +1,49 @@
 {
-    "wechat_path": "D:\\Weixin\\Weixin.exe",
-    "wechat_start_timeout": 40,
-    "enter_wechat_btn": "templates/00_enter_wechat.png",
-    "search_box": "templates/07_search_box.png",
-    "popup_close": "templates/06_popup_close.png",
-    "popup_title": "templates/08_popup_title.png",
-    "miniprogram_search_icon": "templates/02_miniprogram_icon.png",
-    "signin_nav_steps": [
-        {
-            "name": "日常管理",
-            "template": "templates/21_daily_manage.png",
-            "scroll": true
-        },
-        {
-            "name": "签到消息",
-            "template": "templates/22_signin_msg.png",
-            "scroll": true
-        },
-        {
-            "name": "每日签到",
-            "template": "templates/23_daily_signin.png",
-            "scroll": true
-        },
-        {
-            "name": "每日签到里的进入按钮",
-            "template": "templates/24_signin_enter.png",
-            "scroll": true
-        }
-    ],
-    "search_keyword": "油学通",
-    "miniprogram_title": "油学通",
-    "signin_time_start": "20:50",
-    "signin_time_end": "21:30",
-    "confidence": 0.8,
-    "click_retry": 3,
-    "page_wait_timeout": 20,
-    "shutdown_delay": 60,
-    "shutdown_after_success": false,
-    "log_dir": "logs",
-    "keep_runs": 10,
-    "keep_days": 10,
-    "screenshot_on_error": true,
-    "screenshot_jpeg_quality": 75,
-    "wifi_ssid": "XSYU_WLAN",
-    "wifi_username": "你的校园网账号（学号）",
-    "wifi_password": "你的校园网密码"
+  "wechat_path": "D:\\Weixin\\Weixin.exe",
+  "wechat_start_timeout": 40,
+  "enter_wechat_btn": "templates/00_enter_wechat.png",
+  "search_box": "templates/07_search_box.png",
+  "popup_close": "templates/06_popup_close.png",
+  "popup_title": "templates/08_popup_title.png",
+  "miniprogram_search_icon": "templates/02_miniprogram_icon.png",
+  "signin_nav_steps": [
+    {
+      "name": "日常管理",
+      "template": "templates/21_daily_manage.png",
+      "scroll": true
+    },
+    {
+      "name": "签到消息",
+      "template": "templates/22_signin_msg.png",
+      "scroll": true
+    },
+    {
+      "name": "每日签到",
+      "template": "templates/23_daily_signin.png",
+      "scroll": true
+    },
+    {
+      "name": "每日签到里的进入按钮",
+      "template": "templates/24_signin_enter.png",
+      "scroll": true
+    }
+  ],
+  "search_keyword": "油学通",
+  "miniprogram_title": "油学通",
+  "signin_time_start": "20:50",
+  "signin_time_end": "21:30",
+  "confidence": 0.8,
+  "click_retry": 3,
+  "page_wait_timeout": 20,
+  "shutdown_delay": 60,
+  "shutdown_after_success": false,
+  "log_dir": "logs",
+  "keep_runs": 10,
+  "keep_days": 10,
+  "keep_fail_days": 90,
+  "screenshot_on_error": true,
+  "screenshot_jpeg_quality": 75,
+  "wifi_ssid": "XSYU_WLAN",
+  "wifi_username": "你的校园网账号（学号）",
+  "wifi_password": "你的校园网密码"
 }

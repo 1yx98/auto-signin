@@ -14,6 +14,7 @@
 import os
 import sys
 import json
+import re
 import time
 import subprocess
 import shutil
@@ -145,22 +146,72 @@ RUN_DIR = os.path.join(LOG_DIR, f"run_{RUN_ID}")
 os.makedirs(RUN_DIR, exist_ok=True)
 KEEP_RUNS = int(CONFIG.get("keep_runs", 10))
 KEEP_DAYS = int(CONFIG.get("keep_days", 10))  # 日志最多保留天数（超过则删除，至少保留最近KEEP_RUNS次）
+# 失败现场单独放宽保留：成功截图看一次就够了，但**失败现场是排查的唯一证据**，
+# 而且往往是"过几天才发现漏签"才去翻。所以失败目录按更长的天数保留，
+# 且不受 KEEP_RUNS 挤压（否则跑得多时会被"最近10次"挤掉）。
+KEEP_FAIL_DAYS = int(CONFIG.get("keep_fail_days", 90))
+
+
+def _run_outcome(run_dir):
+    """判断一次运行的结果：'success' / 'fail' / 'not_time' / 'unknown'。
+
+    优先读 result.txt（收尾时写的，最权威）；读不到就退回看截图文件名。
+    判不出来时**保守当作 fail**——宁可多留一个现场，也不能把真失败当成功清掉。
+    """
+    # 1) result.txt 最权威
+    try:
+        rp = os.path.join(run_dir, "result.txt")
+        if os.path.isfile(rp):
+            with open(rp, "r", encoding="utf-8", errors="ignore") as f:
+                head = f.read(400)
+            m = re.search(r"结果:\s*(\w+)", head)
+            if m:
+                return m.group(1).strip().lower()
+    except Exception:
+        pass
+    # 2) 退回看截图名：失败现场有 FAIL_ / EXCEPTION 标记
+    try:
+        for n in os.listdir(run_dir):
+            if n.startswith("FAIL_") or "EXCEPTION" in n or "_FAIL_" in n:
+                return "fail"
+            if "签到成功_已签到" in n:
+                return "success"
+    except Exception:
+        pass
+    # 3) 判不出来：保守当失败（多留现场，不漏证据）
+    return "unknown"
+
+
 def _prune_old_runs():
     try:
         dirs = sorted([d for d in os.listdir(LOG_DIR)
                        if d.startswith("run_") and os.path.isdir(os.path.join(LOG_DIR, d))], reverse=True)
-        # 1) 按天数清理：删除超过 KEEP_DAYS 天的运行目录
-        cutoff = datetime.now() - timedelta(days=KEEP_DAYS)
+        now = datetime.now()
+        # 失败目录用更长的保留期；成功/未知目录用原来的 KEEP_DAYS
+        fail_cutoff = now - timedelta(days=KEEP_FAIL_DAYS)
+        ok_cutoff = now - timedelta(days=KEEP_DAYS)
+
+        protected = set()   # 还在保留期内的失败目录，绝不被 KEEP_RUNS 挤掉
         for d in dirs:
             try:
                 dt = datetime.strptime(d[4:19], "%Y%m%d_%H%M%S")
-                if dt < cutoff:
-                    shutil.rmtree(os.path.join(LOG_DIR, d), ignore_errors=True)
             except Exception:
-                pass
-        # 2) 至少保留最近 KEEP_RUNS 次（防止10天内运行次数太少、排查时无日志）
+                continue
+            outcome = _run_outcome(os.path.join(LOG_DIR, d))
+            is_fail = outcome in ("fail", "crash", "unknown")
+            if is_fail:
+                if dt < fail_cutoff:
+                    shutil.rmtree(os.path.join(LOG_DIR, d), ignore_errors=True)
+                else:
+                    protected.add(d)
+            else:
+                if dt < ok_cutoff:
+                    shutil.rmtree(os.path.join(LOG_DIR, d), ignore_errors=True)
+
+        # 至少保留最近 KEEP_RUNS 次（失败目录已在上面单独判定，这里不参与挤压）
         remaining = sorted([d for d in os.listdir(LOG_DIR)
-                           if d.startswith("run_") and os.path.isdir(os.path.join(LOG_DIR, d))], reverse=True)
+                            if d.startswith("run_") and os.path.isdir(os.path.join(LOG_DIR, d))
+                            and d not in protected], reverse=True)
         for old in remaining[KEEP_RUNS:]:
             shutil.rmtree(os.path.join(LOG_DIR, old), ignore_errors=True)
     except Exception:

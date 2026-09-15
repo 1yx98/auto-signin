@@ -131,6 +131,11 @@ def test_config():
             problems.append("keep_days 应为整数")
         if not isinstance(cfg.get("keep_runs"), int):
             problems.append("keep_runs 应为整数")
+        if not isinstance(cfg.get("keep_fail_days"), int):
+            problems.append("keep_fail_days 应为整数（失败现场保留天数）")
+        elif cfg.get("keep_fail_days") < cfg.get("keep_days", 0):
+            problems.append("keep_fail_days(%s) 不应小于 keep_days(%s)：失败现场必须留更久"
+                            % (cfg.get("keep_fail_days"), cfg.get("keep_days")))
         q = cfg.get("screenshot_jpeg_quality")
         if not (isinstance(q, int) and 0 <= q <= 100):
             problems.append("screenshot_jpeg_quality 应在 0~100")
@@ -234,6 +239,84 @@ def test_signin_contracts():
     # 台账写入必须被 try 包着（失败不能影响主流程）
     check("台账调用来自 history 模块", lambda: "import history" in src or "history as" in src or (_ for _ in ()).throw(
         AssertionError("signin.py 没有导入 history 模块")))
+
+    # 失败现场保留机制（_run_outcome 必须存在，且 re 必须已导入）
+    check("有 _run_outcome()（判断运行成败）", lambda: "_run_outcome" in top_funcs or (_ for _ in ()).throw(
+        AssertionError("signin.py 找不到 _run_outcome()，失败现场保留会失效")))
+    check("常量存在 KEEP_FAIL_DAYS", lambda: "KEEP_FAIL_DAYS" in top_assigns or (_ for _ in ()).throw(
+        AssertionError("signin.py 顶层找不到 KEEP_FAIL_DAYS")))
+    check("已导入 re（_run_outcome 依赖）", lambda: bool(re.search(r"^\s*import re\s*$", src, re.M)) or (_ for _ in ()).throw(
+        AssertionError("signin.py 没导入 re，_run_outcome 里的 re.search 会 NameError（被 except 吞掉→功能静默失效）")))
+
+    # 清理逻辑必须保护失败目录（不能被 KEEP_RUNS 挤掉）
+    def protect_ok():
+        import inspect
+        # 从源码里找 _prune_old_runs 的定义文本
+        m = re.search(r"def _prune_old_runs\(\):(.*?)(?=\ndef |\n_[a-zA-Z]|\Z)", src, re.S)
+        body = m.group(1) if m else ""
+        if "protected" not in body:
+            raise AssertionError("_prune_old_runs 没有 protected 集合，失败目录会被 KEEP_RUNS 挤掉")
+        if "fail_cutoff" not in body:
+            raise AssertionError("_prune_old_runs 没有用 fail_cutoff，失败目录没按 KEEP_FAIL_DAYS 保留")
+        if "d not in protected" not in body:
+            raise AssertionError("KEEP_RUNS 截断时没有排除 protected，失败目录仍会被删")
+        return "失败目录受保护"
+    check("清理时保护失败现场", protect_ok)
+
+
+def test_run_outcome():
+    section("失败现场判定 _run_outcome()")
+    # 把 _run_outcome 单独从 AST 里抠出来执行，不 import signin.py
+    import ast as _ast
+    p = os.path.join(HERE, "signin.py")
+    try:
+        with open(p, encoding="utf-8") as f:
+            tree = _ast.parse(f.read())
+    except Exception as e:
+        bad("解析 signin.py", str(e))
+        return
+    fn = next((n for n in tree.body if isinstance(n, _ast.FunctionDef) and n.name == "_run_outcome"), None)
+    if fn is None:
+        bad("提取 _run_outcome", "找不到该函数")
+        return
+    ns = {"os": os, "re": re}
+    try:
+        exec(compile(_ast.Module(body=[fn], type_ignores=[]), "<x>", "exec"), ns)
+    except Exception as e:
+        bad("编译 _run_outcome", str(e))
+        return
+    run_outcome = ns["_run_outcome"]
+
+    def mk(result=None, files=None):
+        d = tempfile.mkdtemp(prefix="smoke_ro_")
+        if result is not None:
+            with open(os.path.join(d, "result.txt"), "w", encoding="utf-8") as fh:
+                fh.write(result)
+        for f in (files or []):
+            open(os.path.join(d, f), "w").close()
+        return d
+
+    cases = [
+        ("result.txt 说 success", mk(result="结果: success\n退出码: 0"), "success"),
+        ("result.txt 说 fail", mk(result="结果: fail\n退出码: 1"), "fail"),
+        ("result.txt 说 not_time", mk(result="结果: not_time\n退出码: 3"), "not_time"),
+        ("只有 FAIL_ 截图", mk(files=["210609_FAIL_顶部搜索框.png"]), "fail"),
+        ("只有成功截图", mk(files=["210612_签到成功_已签到.png"]), "success"),
+        ("EXCEPTION 截图", mk(files=["213000_第1轮_EXCEPTION.png"]), "fail"),
+        ("空目录 → 保守当失败", mk(), "unknown"),
+        ("result 损坏 + FAIL 图", mk(files=["x_FAIL_y.png"], result="乱码"), "fail"),
+    ]
+    for tag, d, expect in cases:
+        try:
+            got = run_outcome(d)
+            if got != expect:
+                bad("_run_outcome " + tag, "期望 %s，实际 %s" % (expect, got))
+            else:
+                ok("_run_outcome " + tag, got)
+        except Exception as e:
+            bad("_run_outcome " + tag, str(e))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def test_bat_ascii():
@@ -436,6 +519,7 @@ def main():
     test_config()
     test_templates_exist()
     test_signin_contracts()
+    test_run_outcome()
     test_bat_ascii()
     test_history()
     test_notify()
