@@ -302,7 +302,6 @@ def test_signin_contracts():
         return "绿块越出窗口即拒绝"
     check("防线②补：绿块必须落在窗口内", green_in_window_ok)
 
-    # 列表短路必须"宁可漏判也不误判"：拿不到窗口矩形时不许乐观判成功
     # ★★ 架构红线（2026-09-15）：绝不允许"凭屏幕颜色直接判签到成功"。
     # 9-15 假成功的根本教训：颜色判定会受壁纸/窗口尺寸/主题/遮挡影响，本质不可靠。
     # 它可以用来"点按钮"（点错只是重试），但绝不能用来"宣布成功"（判错=静默漏签）。
@@ -390,6 +389,30 @@ def test_signin_contracts():
                 "被 except 吞掉导致时间窗守卫静默失效。请把初始化提到阶段A 之前。")
         return "finish_clicks 初始化早于使用"
     check("阶段A守卫依赖的变量已先初始化", finish_clicks_init_ok)
+
+    # ★ scan_buttons 不得对灰色掩码做 MORPH_CLOSE 闭运算（2026-09-15 修复）
+    # 原因：闭运算会把「已签到」按钮与周围区域糊成一整块(实测 848x847)，
+    # findContours(RETR_EXTERNAL) 只取最外层 → 按钮被吞掉、整块因高度超限被淘汰
+    # → 灰色'已签到'永远识别不到 → 签到成功了却判失败（9-15 21:16 真实发生）。
+    def no_close_on_gray():
+        # 用 AST 查真实调用，避开注释里提到该函数名造成的误报
+        target = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "scan_buttons":
+                target = n
+                break
+        if target is None:
+            raise AssertionError("找不到 scan_buttons()")
+        for sub in ast.walk(target):
+            if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "morphologyEx"):
+                raise AssertionError(
+                    "scan_buttons() 里又出现了 morphologyEx（闭运算）！实测它会把「已签到」按钮"
+                    "与周边糊成 848x847 的大块，导致 findContours 吞掉真正的按钮 → "
+                    "签到成功却判失败。去掉闭运算后按钮可被准确切出(764x90/填充1.0)，"
+                    "且各场景无新增误判（地图页灰块被 yf≤0.80 挡掉）。")
+        return "未对掩码做闭运算（按钮能被准确切出）"
+    check("scan_buttons 不做闭运算", no_close_on_gray)
 
     def conservative_ok():
         m = re.search(r"def first_card_status_green\(.*?\n(?=def )", src, re.S)

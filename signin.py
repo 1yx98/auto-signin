@@ -1758,14 +1758,23 @@ def scan_buttons(hwnd, y_frac=0.46):
     masks = {
         "blue":  cv2.inRange(hsv, (95, 70, 70), (122, 255, 255)),
         "green": cv2.inRange(hsv, (40, 70, 60), (87, 255, 255)),
-        # gray 覆盖两种灰按钮：已签到(中灰) 与 定位页"不在区域内/定位中"(浅灰,V≈244)；
-        # V 上限 253 用于排除纯白背景(255)，S≤25 保证只收近灰、不收彩色。
+        # gray 覆盖两种灰按钮：已签到(浅灰,V≈204) 与 定位页"不在区域内/定位中"。
+        # 【2026-09-15 修正错误的注释与假设】原文写"V 上限 253 用于排除纯白背景(255)"——
+        # 实测发现这与实际界面**正好相反**：签到详情页里"，已签到"按钮上下是**纯白(V=255)**，
+        # 按钮本身才是**浅灰(V=204)**。所以 V≤253 并不会误收白背景，反而正好框住按钮。
+        # S≤25 保证只收近灰、不收彩色。
         "gray":  cv2.inRange(hsv, (0, 0, 150), (179, 25, 253)),
     }
-    kern = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 9))
     out = []
     for kind, mask in masks.items():
-        m = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kern)
+        # 【2026-09-15 修复·漏判'已签到'】原实现在这里做了 MORPH_CLOSE(15,9) 闭运算，
+        # 理由注释是"防止窗口圆角外透出的桌面壁纸被闭成块"。但闭运算的副作用是：
+        # 它会把按钮与周围区域**糊成一整块**(实测 848x847)，而 findContours(RETR_EXTERNAL)
+        # 只取最外层轮廓 → 真正的按钮被吞掉、整块又因高度 847 远超上限 130 被淘汰
+        # → **灰色'已签到'按钮永远识别不到** → 签到成功了却判失败(9-15 21:16 真实发生)。
+        # 实测去掉闭运算后：已签到按钮 764x90/填充1.0 被准确切出，且各场景无新增误判
+        # （地图页那个 yf=0.833 的灰块仍被 signed_detail_button 的 yf≤0.80 挡在外面）。
+        m = mask
         cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         rej = []
         for c in cnts:
