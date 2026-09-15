@@ -120,6 +120,16 @@ CONFIDENCE = CONFIG.get("confidence", 0.8)
 SHUTDOWN_DELAY = CONFIG.get("shutdown_delay", 60)
 SHUTDOWN_AFTER_SUCCESS = CONFIG.get("shutdown_after_success", True)
 SCREENSHOT_ON_ERROR = CONFIG.get("screenshot_on_error", True)
+# 截图压缩质量（JPEG，1~100）。0 或 false 表示不压缩、存原始 PNG。
+# 背景：2880x1800 满屏 PNG 平均 1.0MB/张，一次运行 29 张 = 25MB，一天能吃掉几十 MB。
+# 实测 JPEG q75 可压到约 37%（1.59MB -> 581KB）且保留原始分辨率，
+# 排查问题时按钮文字、界面细节都还看得清——比"缩放"划算得多（缩到 50% 也才省一半）。
+# 失败现场（FAIL_*/EXCEPTION）不受此设置影响，永远存原始 PNG，保证现场不失真。
+SCREENSHOT_JPEG_QUALITY = CONFIG.get("screenshot_jpeg_quality", 75)
+try:
+    SCREENSHOT_JPEG_QUALITY = int(SCREENSHOT_JPEG_QUALITY)
+except Exception:
+    SCREENSHOT_JPEG_QUALITY = 75
 
 # 校园网门户特征（与 wifi_helper/wifi_auto_login.py 保持一致）：
 # 用于把"TCP 能连但被门户拦着"和"真能上外网"区分开，见 net_state()
@@ -350,9 +360,33 @@ def log_environment_snapshot():
 # ==================== 截图工具 ====================
 _step = [0]
 def shot(tag):
-    p = os.path.join(RUN_DIR, f"{datetime.now().strftime('%H%M%S')}_{tag}.png")
+    """截图存到本次运行目录。
+
+    默认存 JPEG（见 SCREENSHOT_JPEG_QUALITY）以省空间；
+    **失败现场**（tag 含 FAIL_ / EXCEPTION）永远存原始 PNG，保证排查时图像不失真。
+    任何异常都只打 warning，绝不让截图失败影响签到流程。
+    """
+    important = ("FAIL_" in tag) or ("EXCEPTION" in tag)
+    use_jpeg = (SCREENSHOT_JPEG_QUALITY > 0) and not important
+    ext = ".jpg" if use_jpeg else ".png"
+    p = os.path.join(RUN_DIR, f"{datetime.now().strftime('%H%M%S')}_{tag}{ext}")
     try:
-        pyautogui.screenshot(p)
+        if use_jpeg:
+            # 先抓到内存再自己编码：pyautogui 只能按扩展名存，控制不了质量参数。
+            im = pyautogui.screenshot()
+            # cv2 的 imencode 不认中文路径，必须先编到内存再写文件（与项目其它地方一致）。
+            bgr = cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+            ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, SCREENSHOT_JPEG_QUALITY])
+            if ok:
+                with open(p, "wb") as f:
+                    f.write(buf.tobytes())
+            else:
+                # 编码失败就退回存 PNG，不能因为省空间反而丢截图
+                p = p[:-4] + ".png"
+                im.save(p)
+                ext = ".png"
+        else:
+            pyautogui.screenshot(p)
         logger.info(f"[截图] {tag} -> {os.path.basename(p)}")
     except Exception as e:
         logger.warning(f"[截图] 失败 {tag}: {e}")

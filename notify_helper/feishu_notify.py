@@ -333,7 +333,7 @@ def read_run_summary(run_dir=None):
             pass
 
     try:
-        out["screenshots"] = [n for n in os.listdir(run_dir) if n.lower().endswith(".png")
+        out["screenshots"] = [n for n in os.listdir(run_dir) if n.lower().endswith((".png", ".jpg"))
                               and n.startswith("FAIL_")]
     except Exception:
         pass
@@ -418,7 +418,7 @@ def notify_early_exit(reason, detail_lines=None, run_dir=None, level="fail",
     if run_dir and os.path.isdir(run_dir):
         lines.append("目录：`%s`" % os.path.basename(run_dir))
         try:
-            shots = sorted(n for n in os.listdir(run_dir) if n.lower().endswith(".png"))
+            shots = sorted(n for n in os.listdir(run_dir) if n.lower().endswith((".png", ".jpg")))
             if shots:
                 lines.append("截图：%s" % "、".join(shots[-3:]))
         except Exception:
