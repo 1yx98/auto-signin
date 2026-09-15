@@ -960,6 +960,85 @@ def test_notify():
         return "有中断兜底 + 降噪条件"
     check("被强杀时会补发结果未知提醒", kill_guard_ok)
 
+    # 【2026-09-16 新增】光有 atexit 兜底是**不够的** —— 实测 taskkill /F 与
+    # terminate() 下 atexit 都不执行，而"用户掐脚本"的现实路径正是这两条
+    # （关窗口 / 任务管理器结束任务 / 计划任务 30 分钟强杀）。
+    # 所以必须存在一个**不依赖进程存活**的持久化机制，让下次启动代为报告。
+    # 本断言锁死该机制的关键要素，防止将来被"简化"掉。
+    def stale_guard_ok():
+        src = open(os.path.join(HERE, "signin.py"), encoding="utf-8").read()
+        tree = ast.parse(src, filename="signin.py")
+        names = {n.name for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef)}
+
+        # A) 三个关键函数必须存在
+        need_fn = {"_guard_mark_in_progress": "落盘进行中标记",
+                   "_guard_clear_in_progress": "收尾清除标记",
+                   "check_stale_in_progress": "下次启动检查残留"}
+        missing_fn = [k for k in need_fn if k not in names]
+        if missing_fn:
+            raise AssertionError(
+                "缺少强杀兜底函数 %s —— atexit 在 taskkill /F 下不执行，"
+                "没有持久化标记就无法兜住计划任务强杀" % missing_fn)
+
+        # B) 必须用信号处理（时效快路径），且 SIGINT/SIGTERM 都注册
+        if not re.search(r"_signal\.signal\(\s*_signal\.SIGINT", src):
+            raise AssertionError("没注册 SIGINT 处理：Ctrl+C 中断会无声退出")
+        if not re.search(r"_signal\.signal\(\s*_signal\.SIGTERM", src):
+            raise AssertionError("没注册 SIGTERM 处理：关窗口/terminate 会无声退出")
+
+        # C) main() 里必须调用 check_stale_in_progress —— 否则标记写了没人读，
+        #    等于建了一个永远不查的账本（本项目踩过"台账写了但从不读"的坑）
+        main_fn = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "main":
+                main_fn = n
+                break
+        if main_fn is None:
+            raise AssertionError("找不到 main() 函数")
+        called_in_main = any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "check_stale_in_progress"
+            for n in ast.walk(main_fn))
+        if not called_in_main:
+            raise AssertionError(
+                "main() 里没有调用 check_stale_in_progress()：标记写进了磁盘却没人读，"
+                "强杀兜底形同虚设")
+
+        # D) 标记落盘必须用原子替换（不能写半截 JSON 卡住下次启动）
+        # 【踩坑记录】初版写成 `("os.replace" in ast.dump(n)) or ("os.replace" in src[...])`，
+        # 结果是**永远 PASS 的摆设** —— 因为后半段在源码字符串里搜，而 "os.replace"
+        # 在 step_tracer.py 的注释和别的模块里也出现，必然命中。
+        # 这正是项目里记过的"不能用字符串 in 判断代码有没有做某件事"的坑，又踩了一次。
+        # 现在改成：只在**该函数节点内部**找 os.replace 的真实调用节点。
+        def _calls_replace(fn_node):
+            for sub in ast.walk(fn_node):
+                if isinstance(sub, ast.Call):
+                    f = sub.func
+                    if (isinstance(f, ast.Attribute) and f.attr == "replace"
+                            and isinstance(f.value, ast.Name) and f.value.id == "os"):
+                        return True
+            return False
+
+        mark_fn = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "_guard_mark_in_progress":
+                mark_fn = n
+                break
+        if mark_fn is None:
+            raise AssertionError("找不到 _guard_mark_in_progress()")
+        if not _calls_replace(mark_fn):
+            raise AssertionError(
+                "_guard_mark_in_progress() 内部没有调用 os.replace（原子替换）—— "
+                "强杀可能留下半截 JSON，下次启动读到坏标记")
+
+        # E) 标记文件路径必须在 .agent/ 下（与 self_heal 同处，且已被 .gitignore 忽略）
+        if ".agent" not in src.split("_GUARD_STATE_PATH", 1)[1][:200]:
+            raise AssertionError("进行中标记不在 .agent/ 目录下，可能被误提交进仓库")
+
+        return "残留标记（主保障）+ signal（快路径）+ main 启动时检查，要素齐全"
+    check("强杀兜底：残留标记机制完整（不依赖 atexit）", stale_guard_ok)
+
     # 台账写入失败必须在 run.log 可见（原来是纯 pass，空了几个月没人发现）
     def ledger_visible_ok():
         src = open(os.path.join(HERE, "signin.py"), encoding="utf-8").read()

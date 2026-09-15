@@ -2620,6 +2620,13 @@ def click_sign_button():
         _GUARD["finish_clicks"] = max(_GUARD["finish_clicks"], finish_clicks)
     except Exception:
         pass
+    # 【2026-09-16】同时落盘"进行中"标记 —— 这是唯一能兜住 taskkill /F 的手段。
+    # 放在这里（而非进程启动时）是有意的：只有"真点过完成签到"才值得在中断时告警，
+    # 否则每次早退都会留下标记，下次启动就补发一堆无意义提醒。
+    try:
+        _guard_mark_in_progress("已点击完成签到，等待硬确认")
+    except Exception as _gm:
+        logger.warning("[兜底] 落盘进行中标记异常（忽略）: %s" % _gm)
     TRACE.end_step("success")
     TRACE.begin_step("S7", "提交后硬确认")
 
@@ -2860,6 +2867,116 @@ _FEISHU_DONE = [False]
 # 2026-09-15 已删 —— 留着会让人误以为"中断兜底还会参考是否到过详情页"。
 _GUARD = {"finish_clicks": 0}
 
+# 【2026-09-16 修复·强杀兜底】atexit 在 taskkill /F 与 terminate() 下**都不执行**
+# （三种终止方式实测：正常退出→执行；taskkill /F→不执行；terminate()→不执行）。
+# 而"用户掐脚本"的现实路径正是关窗口 / 任务管理器结束任务 / 计划任务 30 分钟强杀
+# （install_task.ps1 设了 ExecutionTimeLimit=30 分钟），全是 atexit 救不了的那两条。
+# 于是原来那条兜底只能覆盖"正常退出"——而正常退出本来就发过通知了，
+# _FEISHU_DONE 已置位 → 兜底必然 return。**实际保护率接近 0%。**
+#
+# 唯一能覆盖全部场景的机制：**进程死前把状态留在磁盘上，下次启动时补发**。
+# 进程被内核强杀时没有任何执行机会，只能靠"下次运行"这个时机来发现"上次没善终"。
+# 用 .agent/ 目录（已被 .gitignore 忽略，self_heal.py 也在用），原子写盘。
+_GUARD_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 ".agent", "_in_progress.json")
+
+
+def _guard_mark_in_progress(reason=""):
+    """落盘"本轮已点过完成签到但尚未收尾"的标记。
+
+    只在 **首次点击"完成签到"之后** 调用一次——这是"值得在中断时告警"的门槛：
+    还没点过签到的中断没有信息量（下次正常跑就行），不该制造噪音。
+    原子写盘（临时文件 + os.replace），避免下一次启动读到半截 JSON。
+    """
+    try:
+        d = os.path.dirname(_GUARD_STATE_PATH)
+        os.makedirs(d, exist_ok=True)
+        tmp = _GUARD_STATE_PATH + ".tmp"
+        payload = {
+            "run_dir": os.path.basename(globals().get("RUN_DIR") or ""),
+            "run_id": globals().get("RUN_ID") or "",
+            "t0": globals().get("T0"),
+            "finish_clicks": _GUARD.get("finish_clicks", 0),
+            "reason": reason,
+            "ts": time.time(),
+        }
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, _GUARD_STATE_PATH)
+    except Exception as e:
+        # 标记写不进不是致命问题（只是兜底能力退化），但必须留下痕迹
+        logger.warning("[兜底] 写进行中标记失败（强杀兜底将退化为不可用）: %s" % e)
+
+
+def _guard_clear_in_progress():
+    """收尾时清除标记。走到这里说明本轮已善终（无论成功/失败/not_time）。"""
+    try:
+        if os.path.isfile(_GUARD_STATE_PATH):
+            os.remove(_GUARD_STATE_PATH)
+    except Exception as e:
+        logger.warning("[兜底] 清除进行中标记失败（下次启动可能补发一次结果未知提醒）: %s" % e)
+
+
+def check_stale_in_progress():
+    """启动时检查上次是否留下"已点完成签到但未收尾"的残留标记。
+
+    【为什么必须放在 main() 开头】这是**唯一**能兜住 taskkill /F 的手段：
+    上次进程已被内核杀死，不可能再执行任何代码；只能由这一次运行来"代它说话"。
+
+    返回 True 表示发现残留并已补发提醒（供日志区分）。
+    读不到/格式坏 → 删除标记并按"无残留"处理（避免坏标记永久卡住每次启动都告警）。
+    """
+    try:
+        if not os.path.isfile(_GUARD_STATE_PATH):
+            return False
+        data = {}
+        try:
+            with open(_GUARD_STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.warning("[兜底] 残留标记损坏，按无残留处理并删除: %s" % e)
+        stale_run = data.get("run_dir") or ""
+        t0 = data.get("t0")
+        # 时间描述：让提醒里能说清"是哪一次被中断的"
+        when = ""
+        try:
+            if t0:
+                when = datetime.fromtimestamp(float(t0)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            when = ""
+        if stale_run:
+            logger.warning("[兜底] 发现上次未善终的痕迹：run_dir=%s finish_clicks=%s（%s）"
+                           % (stale_run, data.get("finish_clicks"), when or "时间未知"))
+            _guard_clear_in_progress()
+            detail = ["（上次进程被强制结束，没能自己报告结果——本提醒由下一次运行代发）"]
+            if when:
+                detail.append("上次开始时间：%s" % when)
+            if stale_run:
+                detail.append("上次运行目录：`%s`" % stale_run)
+                _rd = os.path.join(LOG_DIR, stale_run)
+                if os.path.isdir(_rd):
+                    try:
+                        shots = sorted(n for n in os.listdir(_rd)
+                                       if n.lower().endswith((".png", ".jpg")))
+                        if shots:
+                            detail.append("现场截图：%s" % "、".join(shots[-3:]))
+                    except Exception:
+                        pass
+                else:
+                    detail.append("（该运行目录已被清理，仅能确认它没走到收尾）")
+            feishu_notify and feishu_notify.notify_early_exit(
+                "上次签到运行被强制中断（未善终），且中断前已点击过「完成签到」——"
+                "本次结果未知，请人工确认是否已签到",
+                detail_lines=detail, run_dir=os.path.join(LOG_DIR, stale_run) if stale_run else None)
+            return True
+        # 没有 run_dir 的标记没有信息量，直接清掉
+        logger.warning("[兜底] 残留标记缺少 run_dir，删除")
+        _guard_clear_in_progress()
+        return False
+    except Exception as e:
+        logger.warning("[兜底] 检查残留标记异常（忽略）: %s" % e)
+        return False
+
 def _within_signin_window():
     """当前是否还在签到时间窗内（用于决定要不要跑第三轮补救）。
 
@@ -2936,6 +3053,14 @@ def main():
                                if _fl else ""))
     except Exception:
         pass
+    # 【2026-09-16 修复·强杀兜底】检查上次是否"已点完成签到但没走到收尾"——
+    # 这是唯一能兜住 taskkill /F 的时机（上次进程已被内核杀死，不可能再执行代码，
+    # 只能由这一次运行代它把"结果未知"说出来）。必须在 notify_start() 之前，
+    # 否则万一本次也早退，两条通知的先后关系会让人误读。
+    try:
+        check_stale_in_progress()
+    except Exception as _ck:
+        logger.warning("[兜底] 残留标记检查异常（忽略）: %s" % _ck)
     logger.info("=" * 58)
     logger.info("油学通自动签到开始（搜索路径版 / 两轮重试 / 成功硬确认）")
     sw, sh = pyautogui.size()
@@ -3082,6 +3207,13 @@ def main():
         notify_feishu(f"脚本运行中抛出异常：{type(e).__name__}: {e}")
         return 2
     finally:
+        # 【2026-09-16】走到 finally 说明本轮已"善终"（无论成功/失败/not_time/抛异常），
+        # 立刻清掉"进行中"标记 —— 否则下次启动会误以为上次被强杀了并补发告警。
+        # 必须放在 finally 的第一件事：只要进了 finally 就说明进程拿到了收尾机会。
+        try:
+            _guard_clear_in_progress()
+        except Exception as _gc:
+            logger.warning("[兜底] 清除进行中标记异常（忽略）: %s" % _gc)
         # 取消微信置顶（脚本运行期间可能置顶了微信，结束后恢复正常）
         try:
             for _h, _t in enum_windows(True):
@@ -3155,8 +3287,22 @@ if __name__ == "__main__":
     # 原来的实现直接死掉，**不会发任何通知**：
     # 实测 21:16 那次 —— 签到其实已经成功，却因为闭运算 bug 判了 fail，
     # 用户在 21:18:53 把脚本掐了 → 收不到任何消息，只能干等。
-    # 这里注册一个兜底：**只有当"本轮已经点过完成签到、但还没走到收尾"时才补发**，
-    # 避免每次正常启动/退出都制造噪音；也避免误报"签到成功"（它只说"结果未知"）。
+    #
+    # 【2026-09-16 复查·关键修正】原实现只靠 atexit，而实测三种终止方式：
+    #     正常退出     → atexit **执行**
+    #     terminate()  → atexit **不执行**
+    #     taskkill /F  → atexit **不执行**
+    # 而"用户掐脚本"的现实路径（关窗口 / 任务管理器结束任务 / 计划任务 30 分钟强杀，
+    # 见 install_task.ps1 的 ExecutionTimeLimit）全落在"不执行"那两条上。
+    # 更糟的是：正常退出时 notify_feishu() 早已发过结果、_FEISHU_DONE 已置位，
+    # 这条兜底必然 return —— **原实现的保护率接近 0%。**
+    #
+    # 现在改成三层，各管一段，互不替代：
+    #   ① atexit           —— 正常退出（其实用不上，但保留无害）
+    #   ② signal 处理       —— Ctrl+C / 关窗口 / SIGTERM，能"当场"发出提醒，时效最好
+    #   ③ 残留标记（主保障）—— taskkill /F 这类"内核级终止、进程无任何执行机会"，
+    #                          只能靠 check_stale_in_progress() 在**下次启动**时代为报告
+    #   只有 ③ 能覆盖计划任务超时强杀，所以它是主保障，①②是时效优化。
     def _on_exit_guard():
         try:
             if _FEISHU_DONE[0]:
@@ -3171,9 +3317,33 @@ if __name__ == "__main__":
         except Exception:
             pass
 
+    def _on_signal(signum, _frame):
+        """② signal 路径：给进程一个"体面退出"的机会，当场发提醒再退出。
+
+        注意：Windows 下 SIGTERM 对 Popen.terminate() 有效，但 taskkill /F 是
+        内核级终止，进程收不到任何信号 —— 那种情况只能靠 ③ 残留标记兜。
+        """
+        try:
+            logger.warning("[通知] 收到信号 %s，先补发中断提醒再退出" % signum)
+            _on_exit_guard()
+        except Exception:
+            pass
+        # 用 os._exit 而非 sys.exit：信号处理里抛 SystemExit 会被主循环吞掉，
+        # 可能让脚本继续跑。这里明确"到此为止"。
+        os._exit(1)
+
     try:
         import atexit as _atexit
         _atexit.register(_on_exit_guard)
     except Exception:
         pass
+    try:
+        import signal as _signal
+        _signal.signal(_signal.SIGINT, _on_signal)     # Ctrl+C
+        _signal.signal(_signal.SIGTERM, _on_signal)    # terminate() / 关窗口
+    except Exception as _se:
+        try:
+            logger.warning("[通知] 注册信号处理失败（中断提醒将依赖残留标记）: %s" % _se)
+        except Exception:
+            pass
     sys.exit(main())
