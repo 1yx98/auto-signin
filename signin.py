@@ -1832,6 +1832,37 @@ def _ocr_read(engine, bgr):
     return asyncio.run(_go())
 
 
+def _ocr_binarize(crop):
+    """Otsu 二值化：把低对比度的"浅色字 + 浅灰底"拉成纯黑白，大幅提升识别率。
+
+    【为什么需要这一步 —— 2026-09-15 用真实样本实测，这是"已结束读不出"的真根因】
+    灰色按钮的真实配色是 **白字(灰度 255) 画在浅灰底(灰度 204)上**，差值只有 51/255。
+    Windows OCR 对这种低对比度的浅色字非常吃力 —— 只能靠放大到 10x 硬撑，
+    所以低倍数全空。实测（同一张真实「已结束」按钮）：
+
+        处理方式            2x    3x    4x    5x    6x    8x    10x
+        原图                ✗     ✗     ✗     ✗     ✗     ✗     ✓
+        Otsu 二值化         ✓     ✓     ✓     ✓     ✓     ✓     ✓
+
+    这不是微调，是**把"只有 10x 能读"变成"每档都能读"**。
+    另一个真实「已结束」样本更极端：原图 **7 档全空（一次都读不出）**，
+    Otsu 后能读出 4 档。
+
+    Otsu 会自己算一个阈值，把图分成两类 —— 对"浅字 + 浅底"这种双峰分布的
+    正合适：文字归一类（纯黑），背景归一类（纯白），对比度直接拉满到 255。
+
+    注意：二值化后可能出现「已纟」「已」这类残缺结果（笔画被切碎），
+    所以它只作为**补充路径**，原图路径仍然保留，两条都试。
+    """
+    try:
+        g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(g, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    except Exception:
+        return crop
+
+
 def _ocr_pad_to_canvas(crop, pad_frac=0.22):
     """把按钮裁图放到一块白色画布中央，四周留出白边。
 
@@ -1855,35 +1886,40 @@ def _ocr_pad_to_canvas(crop, pad_frac=0.22):
         return crop
 
 
-def ocr_button_text(full, btn, scales=(10, 8, 6, 12, 4), pads=(0, -1, 1, 2)):
-    """裁出按钮→加白边→放大→OCR，返回读到的文字（读不到返回 ""）。
+def ocr_button_text(full, btn, scales=(10, 8, 6, 12, 4, 5, 4, 3, 2), pads=(0, -1, 1, 2),
+                    preprocess=("otsu", "raw")):
+    """裁出按钮→预处理→加白边→放大→OCR，返回读到的文字（读不到返回 ""）。
 
     【这个函数是被真实样本一点点"教"出来的，改动前务必读完这段】
-    2026-09-15 拿到第一张真实「已结束」截图后才发现的规律：
+    2026-09-15 拿到真实「已结束」截图后，逐条发现的规律（按重要性排序）：
 
-    一、放大倍数：**「已结束」比「已签到」难读得多**，两者不对称。
-        「已签到」 4x / 6x / 8x / 10x —— 几乎每档都读得出（实测覆盖率 ~92%）
-        「已结束」 **只有 10x 左右读得出**（低倍数全空）。实测覆盖率对比：
-                      遍历 1650 种裁图组合
-           已签到 命中 1928/2100 = 91.8%
-           已结束 命中   18/1650 =  1.1%
-        原因推测：「签到」笔画多、墨迹多，OCR 信号强；
-                  「结束」笔画少、字形简单，同样字号下信号弱，需要更大放大倍数。
-        → 所以 scales 里 **10 排第一**。漏读「已结束」的后果是**假成功（不可恢复）**，
-          必须优先照顾它，哪怕多花点时间。
+    一、【最关键】必须做 Otsu 二值化，否则「已结束」基本读不出。
+        灰色按钮是"白字(255) + 浅灰底(204)"，对比度只有 51/255，OCR 很吃力。
+        见 _ocr_binarize() 的完整实测数据 —— 原图只有 10x 能读，
+        二值化后 2x~10x **每档都能读**。这是"1.1% 命中率"的真正根因，
+        不是 OCR 天生的能力上限。所以 preprocess 把 "otsu" 排在第一位。
 
     二、**必须给白边**（这是最反直觉的一点）：
         裸按钮贴边 → 读不出；四周留一圈白 → 读出。
-        见 _ocr_pad_to_canvas() 的说明。这一步是「已结束」能读出来的前提。
+        见 _ocr_pad_to_canvas() 的说明。
 
-    三、裁图边界很敏感：同一按钮，裁得偏十几像素就从"读得出"变"读不出"。
+    三、放大倍数：「已结束」比「已签到」难读得多，两者不对称。
+        二值化之前，「已签到」4x/6x/8x/10x 几乎每档都读得出（覆盖率 ~92%），
+        而「已结束」**只有 10x 左右读得出**（低倍数全空，覆盖率仅 ~1%）。
+        原因推测：「签到」笔画多、墨迹多，OCR 信号强；
+                  「结束」笔画少、字形简单，同样字号下信号弱。
+        → 所以 scales 里 **10 排第一**：漏读「已结束」的后果是**假成功（不可恢复）**，
+          必须优先照顾它，哪怕多花点时间。
+        （做了二值化之后这个不对称基本消失，但排序保持不动 —— 它没坏处。）
+
+    四、裁图边界很敏感：同一按钮，裁得偏十几像素就从"读得出"变"读不出"。
         所以 pads 做 ±1/±2 微调。
 
-    四、**合成对照测不出上面任何一条**（合成图 6 档全对、真实样本只有 10x）。
+    五、**合成对照测不出上面任何一条**（合成图 6 档全对、真实样本只有 10x）。
         真实样本回归在 smoke_test.test_ocr_real_samples()，改这个函数必须跑它。
 
-    命中关键词即早退；最坏跑满 4x5=20 档。实测在真实按钮上约 0.2~3 秒，
-    且只在"几何+字迹都过了、马上要判成功"时才发生一次。
+    命中关键词即早退；最坏跑满 2 种预处理 × 4 种 pad × 9 档倍数 = 72 次 OCR，
+    实测在真实按钮上约 0.2~3 秒，且只在"几何+字迹都过了、马上要判成功"时才发生一次。
     """
     eng = _ocr_get_engine()
     if eng is None or full is None or not btn:
@@ -1894,26 +1930,40 @@ def ocr_button_text(full, btn, scales=(10, 8, 6, 12, 4), pads=(0, -1, 1, 2)):
         bw, bh = btn["w"], btn["h"]
         if bw < 20 or bh < 10:
             return ""
-        best = ""
+        # 完整命中（读到「已签到」/「已结束」这类整词）比残缺片段（只读到「已」）优先。
+        # 为什么：OCR 在低倍数下常把词读残（实测见过 '已'、'已纟'、'已签至刂'）。
+        # 残缺片段对否决判据毫无价值 —— 「已」既不是「已签到」也不是「已结束」，
+        # 拿它做判断等于瞎猜。所以先扫描到一个完整词就立刻返回；
+        # 只有整轮都没扫到完整词时，才退回返回残缺片段（聊胜于无，供日志排查）。
         for pad in pads:
             x0 = max(0, bx - pad); y0 = max(0, by - pad)
             x1 = min(W, bx + bw + pad); y1 = min(H, by + bh + pad)
             if x1 - x0 < 20 or y1 - y0 < 10:
                 continue
             crop = full[y0:y1, x0:x1]
-            # 加白边（关键步骤：解决"文字贴边读不出"）
-            padded = _ocr_pad_to_canvas(crop)
-            for s in scales:
-                try:
-                    big = cv2.resize(padded, None, fx=s, fy=s,
-                                     interpolation=cv2.INTER_CUBIC)
-                except Exception:
-                    continue
-                txt = _ocr_read(eng, big)
-                if txt and any(k in txt for k in _OCR_KEYWORDS):
-                    return txt          # 读到关键词就收工
-                if txt and not best:
-                    best = txt
+            for pp in preprocess:
+                # Otsu 二值化：把低对比度浅色字拉成纯黑白（「已结束」能读出的前提）
+                src = _ocr_binarize(crop) if pp == "otsu" else crop
+                # 加白边（关键步骤：解决"文字贴边读不出"）
+                padded = _ocr_pad_to_canvas(src)
+                for s in scales:
+                    try:
+                        if padded.shape[1] * s > 9000 or padded.shape[0] * s > 9000:
+                            continue        # 夹紧尺寸，避免 WinError -2147024809
+                        big = cv2.resize(padded, None, fx=s, fy=s,
+                                         interpolation=cv2.INTER_CUBIC)
+                    except Exception:
+                        continue
+                    txt = _ocr_read(eng, big)
+                    if not txt:
+                        continue
+                    # A) 完整词（命中关键词）→ 立刻收工
+                    if any(k in txt for k in _OCR_KEYWORDS):
+                        return txt
+                    # B) 残缺片段 → 只记录"最长的那个"，不返回，继续找完整词
+                    if len(txt) > len(best):
+                        best = txt
+        # 整轮都没读到完整词：退回最长的残缺片段（可能是'已签'这类部分命中）
         return best
     except Exception as e:
         logger.debug(f"[OCR] 单次识别失败（不否决，按'未知'处理）：{e}")

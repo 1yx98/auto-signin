@@ -25,6 +25,7 @@ import re
 import shutil
 import sys
 import tempfile
+import textwrap
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -480,6 +481,59 @@ def test_signin_contracts():
                 "应该只在'几何+字迹都过了、马上要判成功'时才跑。")
         return "OCR 排在字迹判据之后（仅在即将判成功时复核）"
     check("第三路判据：OCR 调用顺序正确（贵的在后）", ocr_wired_after_style)
+
+    def ocr_otsu_present():
+        """OCR 必须先做 Otsu 二值化。
+
+        2026-09-15 实测根因：灰色按钮是"白字(灰度255) + 浅灰底(灰度204)"，
+        对比度只有 51/255 —— OCR 极难识别，实测「已结束」原图 7 档全空。
+        二值化后从"只有 10x 能读"变成"每档都能读"。
+        这条断言防止有人把二值化路径删掉，让「已结束」重新变成读不出。
+        """
+        if "_ocr_binarize" not in src:
+            raise AssertionError(
+                "找不到 _ocr_binarize() —— Otsu 二值化被删了？"
+                "没有它，低对比度的「已结束」按钮实测 7 档全空、完全读不出。")
+        m = re.search(r"def ocr_button_text\((.*?)(?=\ndef )", src, re.S)
+        body = m.group(1) if m else ""
+        if not body:
+            raise AssertionError("找不到 ocr_button_text()")
+        # 【必须用 AST 查真正的调用，不能用字符串包含 —— 否则会被文档字符串骗】
+        # 实测踩过：把 `src = _ocr_binarize(crop) if ...` 删成 `src = crop` 后，
+        # 函数体里**文档字符串**还留着 "见 _ocr_binarize() 的完整实测数据"，
+        # 字符串 `in` 判断照样为 True → 断言漏检、负向测试通不过。
+        # 这是本文件第二次被"注释/文档字符串"误导（第一次是调用顺序断言）。
+        import ast as _ast
+        m2 = re.search(r"(def ocr_button_text\(.*?)(?=\ndef )", src, re.S)
+        frag = textwrap.dedent(m2.group(1)) if m2 else ""
+        calls = set()
+        try:
+            tree = _ast.parse(frag)
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name):
+                    calls.add(node.func.id)
+        except SyntaxError as e:
+            raise AssertionError("ocr_button_text() 片段无法解析为 AST: %s" % e)
+        if "_ocr_binarize" not in calls:
+            raise AssertionError(
+                "ocr_button_text() 里**实际没有调用** _ocr_binarize() —— "
+                "二值化是「已结束」能读出的前提，不能省。"
+                "（注意：文档字符串里提到不算，必须是真调用。）")
+        # 必须保留 raw 路径（双路径，不是替换）
+        if "raw" not in body:
+            raise AssertionError(
+                "ocr_button_text() 里看不到 raw 路径 —— "
+                "二值化应是**补充**，原图路径必须保留（用户要求'保留而非替换'）。")
+        # Otsu 必须排在 raw 之前（优先试成功率高的）
+        p_otsu = body.find('"otsu"')
+        p_raw = body.find('"raw"')
+        if p_otsu < 0 or p_raw < 0:
+            raise AssertionError("preprocess 里找不到 otsu/raw 标记")
+        if p_raw < p_otsu:
+            raise AssertionError(
+                "raw 排在了 otsu 之前 —— otsu 成功率显著更高，应优先试。")
+        return "Otsu 二值化在、走双路径、且排在 raw 之前"
+    check("第三路判据：OCR 有二值化预处理（低对比度根因修复）", ocr_otsu_present)
 
     # 关键护栏仍在：详情页判定 + 重进刷新（这两个才是权威依据）
     for fn in ("open_signin_entry", "reopen_miniprogram_to_refresh", "click_sign_button"):
@@ -1004,24 +1058,20 @@ def test_ocr_real_samples():
                 img = cv2.imdecode(np.fromfile(p, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if img is None:
                     continue
-                H, W = img.shape[:2]
-                # 定位灰色按钮：优先用项目扫描逻辑（按整图当窗口）
-                orig = signin.win_rect
-                signin.win_rect = lambda h, W=W, H=H: (0, 0, W, H)
-                try:
-                    cap = []
-                    btns = signin.scan_buttons(None, grab_full=cap)
-                except Exception:
-                    btns = []
-                finally:
-                    signin.win_rect = orig
-                gray = [b for b in btns if b.get("kind") == "gray"]
-                if not gray:
-                    # 扫描失败时退回"按钮色块探测"（对这张样本实测有效）
-                    gray = _find_gray_bar(img)
+                # 【为什么只用 _find_gray_bar，不用 scan_buttons】
+                # scan_buttons() 是给"实时抓的微信窗口截图"设计的，它依赖
+                # win_rect/窗口尺寸假设。拿来跑历史样本（尤其 2880x1800 全屏图）时，
+                # 实测**非确定性**：同一个文件连跑 5 次，4 次返回 0 个、
+                # 1 次返回一个 1548x106 的假灰块（整个标题区）。
+                # 这会让测试偶发失败 —— 而**偶发失败比稳定失败更糟**，
+                # 它会让人习惯性重跑、最终把真问题也一起忽略掉。
+                # 所以测试里的样本定位改用**确定性**的 _find_gray_bar()。
+                gray = _find_gray_bar(img)
                 if not gray:
                     continue
-                btn = max(gray, key=lambda b: b.get("w", 0))
+                # 多个候选时，优先选"最像按钮"的：宽高比最接近实测真值 8.5。
+                # （不用 max(w)，否则可能选中标题栏那种超宽块。）
+                btn = min(gray, key=lambda b: abs(b["w"] / float(b["h"]) - 8.5))
                 txt = signin.ocr_button_text(img, btn)
                 hits.append((os.path.basename(p), txt))
 
@@ -1040,6 +1090,86 @@ def test_ocr_real_samples():
 
     if not found_any:
         print("  [跳过] OCR 真实样本回归（logs/samples/ 下没有相应样本）")
+
+
+def test_ocr_no_reverse_misread():
+    """【最关键的反方向断言】真实「已签到」按钮，绝不能读出任何否定词。
+
+    为什么这条最重要：OCR 认错有两个方向，危害完全不对等 ——
+      · 把「已签到」误读成否定词 → 多跑一轮核实（可恢复，只是慢）
+      · 把「已结束」误读成「已签到」 → **假成功**（不可恢复，静默漏签）
+    后者是本项目一直在防的最坏结果。所以"正方向能读出"和
+    "反方向不误读"必须都测，后者是底线。
+
+    做法：拿真实「已签到」样本，穷举 预处理 × pad × 倍数 的全部组合，
+    任何一个组合读出否定词就是 FAIL。
+
+    2026-09-15 实测结果：56 个组合**零反方向误判**。
+    且加了 Otsu 之后，raw 路径原本偶发的「已签至刂」残缺也消失了。
+    """
+    samples_dir = os.path.join(HERE, "logs", "samples")
+    if not os.path.isdir(samples_dir):
+        print("  [跳过] OCR 反方向误判检查（无 samples 目录）")
+        return
+    # 只测「已签到」真值的样本（这些绝不该读出否定词）
+    pos = [os.path.join(samples_dir, n) for n in os.listdir(samples_dir)
+           if "已签到" in n and n.lower().endswith((".png", ".jpg", ".jpeg"))]
+    if not pos:
+        print("  [跳过] OCR 反方向误判检查（没有「已签到」真实样本）")
+        return
+
+    def _run():
+        try:
+            import cv2
+            import numpy as np
+            sys.path.insert(0, HERE)
+            import signin
+        except Exception as e:
+            raise AssertionError("导入失败: %s" % e)
+        eng = signin._ocr_get_engine()
+        if eng is None:
+            raise AssertionError("OCR 引擎不可用，无法验证反方向误判")
+
+        negatives = ("已结束", "已过期", "未开始", "不在区域", "未在区域")
+        bad = []
+        total = 0
+        for p in pos:
+            img = cv2.imdecode(np.fromfile(p, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            bars = _find_gray_bar(img)
+            if not bars:
+                continue
+            # 同 test_ocr_real_samples：优先选宽高比最接近真值 8.5 的候选（确定性）
+            b = min(bars, key=lambda x: abs(x["w"] / float(x["h"]) - 8.5))
+            H, W = img.shape[:2]
+            for pad in (0, -1, 1, 2):
+                x0 = max(0, b["x"] - pad); y0 = max(0, b["y"] - pad)
+                x1 = min(W, b["x"] + b["w"] + pad); y1 = min(H, b["y"] + b["h"] + pad)
+                crop = img[y0:y1, x0:x1]
+                for pp in ("otsu", "raw"):
+                    src = signin._ocr_binarize(crop) if pp == "otsu" else crop
+                    padded = signin._ocr_pad_to_canvas(src)
+                    for s in (10, 8, 6, 12, 4, 5, 3, 2):
+                        if padded.shape[1] * s > 9000 or padded.shape[0] * s > 9000:
+                            continue
+                        big = cv2.resize(padded, None, fx=s, fy=s,
+                                         interpolation=cv2.INTER_CUBIC)
+                        txt = signin._ocr_read(eng, big)
+                        total += 1
+                        if not txt:
+                            continue
+                        hit = [k for k in negatives if k in txt]
+                        if hit:
+                            bad.append((os.path.basename(p), pad, pp, s, txt, hit))
+        if bad:
+            raise AssertionError(
+                "！！发现 %d 处反方向误判（「已签到」被读成否定词）！！\n"
+                "      → 这会导致**多跑一轮**（可恢复，但仍属 bug）：\n%s"
+                % (len(bad), "\n".join("      %s pad=%s %s %sx -> %r"
+                                       % x for x in bad[:10])))
+        return "真实「已签到」在 %d 个组合下零反方向误判" % total
+    check("OCR 反方向安全：真实「已签到」绝不读成否定词", _run)
 
 
 def _find_gray_bar(img, btn_aspect_min=4.0, btn_aspect_max=14.0):
@@ -1105,6 +1235,16 @@ def _find_gray_bar(img, btn_aspect_min=4.0, btn_aspect_max=14.0):
         aspect = bw / float(bh)
         if not (btn_aspect_min <= aspect <= btn_aspect_max):
             continue
+        # 追加：反推出来的按钮必须**基本落在图内**，且按钮四周也应是灰底。
+        # 不加这条时，标题栏/整页文字块偶尔也会满足上面的条件（灰底占比恰好过 0.5），
+        # 导致测试**偶发**选错区域（实测出现过一次：把整页文字当按钮，
+        # OCR 读回"签到内容．每日签到[窗口]激活后…"）。
+        # 测试必须确定性，所以这里再加一道"按钮框内灰底占比"校验。
+        if bx0 + bw > W or by0 + bh > H:
+            continue
+        box = bgm[by0:by0 + bh, bx0:bx0 + bw]
+        if box.size == 0 or box.mean() < 0.75:
+            continue
         out.append(dict(kind="gray", x=int(bx0), y=int(by0), w=int(bw), h=int(bh),
                         cx=int(cx), cy=int(cy), fill=1.0))
     return out
@@ -1137,6 +1277,7 @@ def main():
     test_notify()
     test_runtime()
     test_ocr_real_samples()
+    test_ocr_no_reverse_misread()
 
     print("\n" + "=" * 60)
     print("通过 %d 项，失败 %d 项" % (len(PASSED), len(FAILED)))
