@@ -20,6 +20,7 @@
 import ast
 import csv
 import json
+import logging
 import os
 import re
 import shutil
@@ -240,9 +241,45 @@ def test_signin_contracts():
     check("有 __main__ 守卫", lambda: True if has_guard else (_ for _ in ()).throw(
         AssertionError("缺 __main__ 守卫，import 会误触发签到")))
 
-    # 台账写入必须被 try 包着（失败不能影响主流程）
-    check("台账调用来自 history 模块", lambda: "import history" in src or "history as" in src or (_ for _ in ()).throw(
-        AssertionError("signin.py 没有导入 history 模块")))
+    # 台账写入必须**真的**接上 history 模块。
+    #
+    # 【2026-09-16 修复·假断言】原来这行是：
+    #     check("台账调用来自 history 模块", lambda: "import history" in src or "history as" in src ...)
+    # 它只在**源码字符串**里找字眼 —— 于是把真导入删掉、只在注释里留一句
+    # "import history 模块"就照样 PASS。实测：把 `import history as signin_history`
+    # 换成 `signin_history = None  # ...import history 模块...`，
+    # 台账写入彻底失效，而 154 项测试**全过**。
+    # 这正是本项目在 P0-1 上已经踩过并记录在案的坑
+    # （"不能用字符串 in 判断代码有没有做某件事"），当时只修了 P0-1 本身，
+    # 没推广到别处。现在改成 AST：必须存在真实的 import 节点，
+    # 且**真实调用**过 append_record / flush_pending。
+    def ledger_wired_ok():
+        imported = False
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                if any(a.name == "history" for a in n.names):
+                    imported = True
+            elif isinstance(n, ast.ImportFrom) and n.module == "history":
+                imported = True
+        if not imported:
+            raise AssertionError(
+                "signin.py 没有真正 `import history`（在注释里提这个字眼不算）——"
+                "台账会静默不写，连续失败告警永不触发")
+
+        calls = set()
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "signin_history"):
+                calls.add(n.func.attr)
+        for need in ("append_record", "flush_pending"):
+            if need not in calls:
+                raise AssertionError(
+                    "signin.py 没有调用 signin_history.%s()（AST 实测）——"
+                    "导入在但没人用，台账同样不会落盘" % need)
+        return ("真 import history，并实际调用 append_record / flush_pending"
+                "（AST 实测，注释骗不过）")
+    check("台账调用来自 history 模块", ledger_wired_ok)
 
     # 失败现场保留机制（_run_outcome 必须存在，且 re 必须已导入）
     check("有 _run_outcome()（判断运行成败）", lambda: "_run_outcome" in top_funcs or (_ for _ in ()).throw(
@@ -830,6 +867,11 @@ def test_fail_evidence_protects_archive():
                                          % (tag, expect, got))
 
             # ---- 端到端：30 天前的失败现场必须在 KEEP_UNKNOWN_DAYS=14 下存活 ----
+            # 【防污染】import signin 会往**真实按天日志**写"[归档] 本次运行目录…"。
+            # 按天日志是排查故障的一级证据，不能混入测试噪音 →
+            # 用环境变量把日志重定向到本次测试的临时目录（见 signin.py 里
+            # SIGNIN_LOG_DIR_OVERRIDE 的注释）。
+            os.environ["SIGNIN_LOG_DIR_OVERRIDE"] = tempfile.mkdtemp(prefix="smoke_ocrlog_")
             import signin as S
             from datetime import timedelta
             d30 = datetime.now() - timedelta(days=30)
@@ -1705,6 +1747,11 @@ def test_ocr_real_samples():
                 import cv2
                 import numpy as np
                 sys.path.insert(0, HERE)
+                # 【防污染】import signin 会建 run 目录并往**按天日志**写字。
+                # 按天日志是排查故障的一级证据，绝不能混进测试噪音 ——
+                # 用环境变量把日志重定向到本次测试的临时目录（见 signin.py 里
+                # SIGNIN_LOG_DIR_OVERRIDE 的注释）。
+                os.environ["SIGNIN_LOG_DIR_OVERRIDE"] = tempfile.mkdtemp(prefix="smoke_ocrlog_")
                 import signin
             except Exception as e:
                 raise AssertionError("导入 OCR 相关模块失败: %s" % e)
@@ -1786,6 +1833,9 @@ def test_ocr_no_reverse_misread():
             import cv2
             import numpy as np
             sys.path.insert(0, HERE)
+            # 【防污染】同 test_ocr_real_samples：把 import signin 的日志
+            # 重定向到临时目录，不写真实的按天日志。
+            os.environ["SIGNIN_LOG_DIR_OVERRIDE"] = tempfile.mkdtemp(prefix="smoke_ocrlog_")
             import signin
         except Exception as e:
             raise AssertionError("导入失败: %s" % e)
@@ -2799,6 +2849,234 @@ def test_no_unclosed_response_handles():
     check("资源：portal 探测的响应已关闭", portal_probe_uses_with)
 
 
+def test_white_screen_semantics():
+    """白屏判定：**"测不了" 不得等于 "白屏"**（P1-1 回归护栏）。
+
+    【为什么必须锁这条】
+      `client_white_ratio()` 原来三种"测不了"的情况（窗口句柄失效 / 窗口在屏幕外 /
+      取图抛异常）统统 `return 1.0` —— 而 1.0 等价于"判定为白屏"。调用方于是会去
+      **杀微信进程重启**：约 40 秒 + 小程序重载的全部风险，还会把真正的错误掩盖掉。
+      修复方向是把"测不了"返回 None、由调用方单独处理。
+
+    【护栏缺口是实测发现的】
+      2026-09-16 用负向测试核查（把 `return None` 改回 `return 1.0`）：
+      **154 项断言全部通过，无一捕获** —— 也就是说 P1-1 修完了却没有护栏，
+      任何人一次不小心的回退都不会被发现。按本项目"每修一处必配负向测试"的规矩，
+      这条必须补上。
+
+    判据分两层（运行时 + AST），任一层失效另一层仍能拦住：
+      1. 运行时：传无效窗口句柄，必须得到 None 而不是一个 >= 阈值的占比；
+      2. AST：`client_white_ratio` 里不得出现**硬编码常量 return**（1.0 误判的形态）。
+    """
+    section("白屏判定：'测不了' 不得等同 '白屏'")
+
+    def _run():
+        try:
+            import cv2  # noqa: F401
+            sys.path.insert(0, HERE)
+            # 【防污染】同其他 import signin 处：把日志重定向到临时目录
+            os.environ["SIGNIN_LOG_DIR_OVERRIDE"] = tempfile.mkdtemp(prefix="smoke_wrlog_")
+            import signin as S
+        except Exception as e:
+            raise AssertionError("导入失败: %s" % e)
+
+        src = open(os.path.join(HERE, "signin.py"), encoding="utf-8").read()
+        tree = ast.parse(src)
+        fn = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "client_white_ratio":
+                fn = n
+        assert fn is not None, "signin.py 找不到 client_white_ratio()"
+
+        # --- 判据 1（AST）：不得出现**数值常量**的 return（`return 1.0` 就是它）---
+        # 注意：`return None` 在 AST 里同样是 ast.Constant(value=None)，
+        # 所以必须把 None 排除掉，否则会把正确实现全部打成 FAIL。
+        const_returns = [n.lineno for n in ast.walk(fn)
+                         if isinstance(n, ast.Return)
+                         and isinstance(n.value, ast.Constant)
+                         and isinstance(n.value.value, (int, float))]
+        assert not const_returns, (
+            "client_white_ratio() 第 %s 行有硬编码**数值常量**的 return ——"
+            "把'测不了'当成'白屏'会让调用方去杀微信重启（代价极高的错误自愈）"
+            % const_returns)
+
+        # --- 判据 2（AST）：必须有 >=2 处"测不了 → None"的显式分支 ---
+        none_returns = [n.lineno for n in ast.walk(fn)
+                        if isinstance(n, ast.Return)
+                        and isinstance(n.value, ast.Constant)
+                        and n.value.value is None]
+        assert len(none_returns) >= 2, (
+            "client_white_ratio() 只有 %d 处 `return None`（期望 >=2："
+            "窗口失效 / 区域为空）—— '测不了' 没有被区分出来" % len(none_returns))
+
+        # --- 判据 3（运行时）：无效句柄必须返回 None，而不是一个"白屏"占比 ---
+        wr = S.client_white_ratio(0)
+        assert wr is None, (
+            "client_white_ratio(0) 返回了 %r（期望 None）——"
+            "无效窗口被当成了白屏，会触发杀微信重启的自愈" % (wr,))
+
+        white, ratio = S.is_white_screen(0)
+        assert white is False and ratio is None, (
+            "is_white_screen(0) = (%r, %r)（期望 (False, None)）——"
+            "'测不了' 不能按'是白屏'处理" % (white, ratio))
+
+        # --- 判据 4（AST）：调用方必须走 is_white_screen，不得直接用裸占比判 ---
+        callers_txt = ast.dump(fn)
+        assert "client_white_ratio" in callers_txt
+        uses_is_white = any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "is_white_screen"
+            for n in ast.walk(tree))
+        assert uses_is_white, (
+            "signin.py 里没有任何地方调用 is_white_screen() ——"
+            "调用方绕过它直接用占比判，None 的语义会被丢回给 1.0 时代")
+
+        return ("client_white_ratio 无硬编码 return、%d 处 return None；"
+                "无效句柄实测得 None；调用走 is_white_screen（AST + 运行时）"
+                % len(none_returns))
+
+    check("白屏：'测不了' 不得等同 '白屏'", _run)
+
+
+def test_cdp_portal_hijack_detection():
+    """CDP 兜底登录：**必须能识别出"被门户劫持"**（2026-09-16 修复的假成功）。
+
+    【为什么必须锁这条】
+      `browser_login._internet_ok()` 决定"这次浏览器登录到底成没成"。
+      原来的判据有两个独立的洞，**方向都是"把被劫持误判成已通"**：
+        ① 不看最终 URL。`generate_204` 被 AC 302 到门户时 urllib 会自动跟随，
+           于是 `r.status` 是 200、body 是门户页 —— 而
+           `r.status in (200, 204)` 这个条件**永远为真**
+           （非 2xx 会抛 HTTPError，根本走不到那一行），等于没校验。
+        ② 特征串只有 3 个，`signin.py` 用的是 7 个。少掉的 `DDDDD` / `upass`
+           正是 Dr.COM 门户**登录表单的字段名**，也就是劫持时最稳定出现的字眼。
+      判错方向的代价不对称：把"已通"误判成"没通"只是多等一轮；
+      把"被劫持"误判成"已通"会让上层**报告登录成功**（假成功），
+      后面所有步骤都建立在错误前提上。
+
+    判据分两层（静态 + 运行时），任一层失效另一层仍能拦住。
+    """
+    section("CDP 登录：被门户劫持不得判成'已通'")
+
+    BL = os.path.join(HERE, "wifi_helper", "browser_login.py")
+
+    def static_checks():
+        src = open(BL, encoding="utf-8").read()
+        tree = ast.parse(src)
+
+        # --- 判据 1（AST）：_internet_ok 必须真的读最终 URL 并查网关 ---
+        # 注意：不能用 `"geturl" in src` —— 注释/文档字符串里出现同样字眼就会
+        # 假通过（本项目已经踩过三次的坑）。只认 ast.Attribute 调用。
+        fn = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "_internet_ok":
+                fn = n
+        assert fn is not None, "browser_login.py 找不到 _internet_ok()"
+
+        geturl_lines = [n.lineno for n in ast.walk(fn)
+                        if isinstance(n, ast.Call)
+                        and isinstance(n.func, ast.Attribute)
+                        and n.func.attr == "geturl"]
+        assert geturl_lines, (
+            "_internet_ok() 没有调用 r.geturl()（AST 实测）——"
+            "不看最终 URL 就无法发现'被 302 到门户网关'，会把劫持判成已通")
+
+        # --- 判据 2（AST）：特征串表必须覆盖 signin.py 的全部门户标记 ---
+        # 从 signin.py 取权威清单，避免两边再次漂移
+        s_src = open(os.path.join(HERE, "signin.py"), encoding="utf-8").read()
+        s_tree = ast.parse(s_src)
+        want = None
+        for n in s_tree.body:
+            if isinstance(n, ast.Assign):
+                tgt = n.targets[0]
+                if isinstance(tgt, ast.Name) and tgt.id == "PORTAL_MARKERS":
+                    want = tuple(e.value for e in n.value.elts)
+        assert want, "signin.py 里没找到 PORTAL_MARKERS 定义"
+
+        got = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Assign):
+                tgt = n.targets[0]
+                if isinstance(tgt, ast.Name) and tgt.id == "PORTAL_MARKERS":
+                    got = tuple(e.value for e in n.value.elts)
+        assert got, (
+            "browser_login.py 没有模块级 PORTAL_MARKERS（AST 实测）——"
+            "门户特征串没有集中定义，两边随时会再次漂移")
+        missing = [m for m in want if m not in got]
+        assert not missing, (
+            "browser_login 的 PORTAL_MARKERS 漏掉了 %s ——"
+            "这些是 signin.py 已确认的门户特征串，漏掉会漏判门户（假成功）" % missing)
+
+        # --- 判据 2b（AST）：PORTAL_MARKERS 必须**真的被用**在 body 检查里 ---
+        # 只定义不使用 = 摆设。负向测试（把 `any(m in body for m in PORTAL_MARKERS)`
+        # 换成 `if False:`）第一版**没被拦住**，才补上这条。
+        uses_markers = False
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Name) and n.id == "PORTAL_MARKERS":
+                uses_markers = True
+        assert uses_markers, (
+            "_internet_ok() 里没有引用 PORTAL_MARKERS（AST 实测）——"
+            "门户特征串定义了却没用，body 检查形同虚设（原地劫持会漏判）")
+
+        # --- 判据 3（运行时）：用真实响应形态喂各种门户，方向必须对 ---
+        import urllib.request
+        sys.path.insert(0, os.path.join(HERE, "wifi_helper"))
+        import importlib
+        if "browser_login" in sys.modules:
+            BL_mod = importlib.reload(sys.modules["browser_login"])
+        else:
+            import browser_login as BL_mod
+
+        class _Fake:
+            def __init__(self, status, url, body):
+                self.status, self._u, self._b = status, url, body
+            def geturl(self):
+                return self._u
+            def read(self, n=-1):
+                return self._b[:n] if n and n > 0 else self._b
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        orig = urllib.request.urlopen
+
+        def drive(status, url, body):
+            urllib.request.urlopen = lambda req, **k: _Fake(status, url, body)
+            try:
+                return BL_mod._internet_ok(("http://example.invalid/generate_204",))
+            finally:
+                urllib.request.urlopen = orig
+
+        probe = "http://connectivitycheck.gstatic.com/generate_204"
+        gw = "http://10.123.0.253/a79.htm"
+        # 真连通：必须 True
+        assert drive(204, probe, b"") is True, "真连通（204 + 空 body）被判成了'没通'"
+        # 被 302 到网关、body 无任何特征串：必须 False（这是原来漏掉的那类）
+        assert drive(200, gw, b"<html>welcome</html>") is False, (
+            "被 302 到门户网关（body 无特征串）被判成了'已通' —— 假成功")
+        # 门户表单字段名：必须 False（原来特征串没列举到这类）
+        assert drive(200, gw, b'<input name="DDDDD"><input name="upass">') is False, (
+            "门户页含 DDDDD/upass 被判成了'已通' —— 假成功")
+        # 【关键】门户**原地返回 200**：最终 URL 仍是探测源本身（不是网关），
+        # 此时唯一能识别的线索就是 body 里的特征串。
+        # 这条专门锁"必须真的检查 body"，否则删掉特征串检查也测不出来
+        # （2026-09-16 的负向测试正是靠它抓出了第一版护栏的摆设性）。
+        assert drive(200, probe, b'<script src="/eportal/x.js"></script>') is False, (
+            "门户原地返回 200（最终 URL 未变、只在 body 里露出 eportal 特征）"
+            "被判成了'已通' —— 说明 body 特征串检查没生效，是假成功")
+        assert drive(200, probe, b'<input name="DDDDD">') is False, (
+            "门户原地返回 200、body 含 DDDDD 被判成了'已通' —— 假成功")
+        # 正常外网站点：必须 True
+        assert drive(200, "http://www.baidu.com", b"<html>baidu</html>") is True, (
+            "正常外网站点被判成了'没通'（方向太保守，会导致无谓重登）")
+
+        return ("_internet_ok 读最终 URL 查网关、PORTAL_MARKERS 与 signin.py 对齐（%d 个）；"
+                "真实响应形态 6 例实测方向全对（含'原地劫持只看 body'）" % len(got))
+
+    check("CDP 登录：被门户劫持不得判成'已通'", static_checks)
+
+
 def test_match_geometry_guard():
     """match() 的几何校验 must_be_in（P0-1，2026-09-16 12:33 事故）。
 
@@ -3032,7 +3310,7 @@ def test_enter_wechat_verifies_click():
         # 断言 2：验证块里必须有 return False
         fn_src = ast.get_source_segment(src, fn)
         assert fn_src, "取不到函数源码"
-        seg = "\n".join(lines[verify_line - 1: verify_line + 14])
+        seg = "\n".join(lines[verify_line - 1: verify_line + 25])
         assert "return False" in seg, (
             "点击后验证块（行%d 起）没有 `return False` —— "
             "验证失败必须立刻中止，不能继续往下走。" % verify_line)
@@ -3041,6 +3319,27 @@ def test_enter_wechat_verifies_click():
         assert "logger.error" in seg, (
             "点击后验证块（行%d 起）没有 logger.error —— "
             "失败必须出声，不能静默吞掉。" % verify_line)
+
+        # 断言 4：验证必须是**重试**而非只查一次
+        #
+        # 【为什么锁死这个】只查一次会把成功误判成失败：
+        #   点击后窗口要重建（实测 sleep 6s 才稳），冷启动/机器卡时按钮可能
+        #   **还在淡出过程中** → 那一刻复核得到高分 → 把"已经点进去了"判成"没生效"。
+        #   这个方向比漏判更糟（假失败会让本来能成的签到被判死）。
+        # 所以必须是"多轮复核、只要有一次确认按钮消失就放行"。
+        # 断言方式：验证块里必须出现 for/while 循环，且循环体内有 match 调用。
+        loop_ok = False
+        for node in ast.walk(fn):
+            if isinstance(node, (ast.For, ast.While)) and node.lineno >= verify_line - 3:
+                has_match = any(isinstance(c, ast.Call) and
+                                isinstance(c.func, ast.Name) and c.func.id == "match"
+                                for c in ast.walk(node))
+                if has_match:
+                    loop_ok = True
+        assert loop_ok, (
+            "点击后的验证块不是**循环重试**（只查一次）—— "
+            "必须多轮复核、任一次确认按钮消失即放行，否则会把"
+            "'点击成功但按钮正在淡出'误判为'点击无效'（假失败，比漏判更糟）")
 
         return ("点击(行%d)后存在验证匹配(行%d)，且带 return False + logger.error"
                 % (first_click, verify_line))
@@ -3098,6 +3397,186 @@ def test_enter_wechat_verifies_click():
     check("进入微信：_hidden 不把'已在前台'当'隐藏到托盘'", hidden_judgment_not_overzealous)
 
 
+def test_smoke_test_does_not_pollute_real_logs():
+    """冒烟测试自己不能污染真实的按天日志。
+
+    【为什么需要这条】
+      `smoke_test.py` 有三处 `import signin`（两处 OCR 测试 + 一处归档清理测试），
+      而 signin.py 在 import 时会**建 run 目录 + 往 signin_YYYYMMDD.log 写两行**。
+      实测后果：跑 8 次冒烟就往当天日志里灌了 50 行 `smoke_basedir_*` 噪音。
+      而**按天日志是排查故障的一级证据**（MEMORY："证据和现场是两份东西"，
+      早期截图会被清理但按天日志仍在）—— 测试把噪音写进证据里，
+      会让人翻真实运行记录时先撞上一堆假条目，**而且很难事后意识到是测试写的**。
+
+      `smoke_basedir_` 这个词本身就是特征：它是 test_history 用的临时目录前缀，
+      真实运行绝不会产生。
+
+    【本测试锁死什么】
+      1) signin.py 必须支持 SIGNIN_LOG_DIR_OVERRIDE 重定向（否则没法防）
+      2) 每一处 import signin 之前都必须设置该变量
+    """
+    section("测试自身：不污染真实按天日志")
+
+    def override_supported():
+        src = open(os.path.join(HERE, "signin.py"), encoding="utf-8").read()
+        tree = ast.parse(src)
+
+        # 1) 必须有一个变量从 SIGNIN_LOG_DIR_OVERRIDE 环境变量取值。
+        #    注意不要假设"赋值右边直接就是 environ.get(...)" ——
+        #    实际写法是 `os.environ.get("X", "").strip()`（外面套了 .strip()），
+        #    所以用"赋值表达式里出现过该字符串常量，且带 environ 字样"来判定。
+        ov_var = None
+        for n in ast.walk(tree):
+            if not isinstance(n, ast.Assign):
+                continue
+            if not isinstance(n.targets[0], ast.Name):
+                continue
+            has_key = any(isinstance(c, ast.Constant) and c.value == "SIGNIN_LOG_DIR_OVERRIDE"
+                          for c in ast.walk(n.value))
+            # 注意：`os.environ` 在 AST 里是 Attribute(attr='environ')，不是 Name ——
+            # 写 `Name(id='environ')` 永远匹配不到（本测试第一版就栽在这）。
+            has_env = any((isinstance(x, ast.Attribute) and x.attr == "environ") or
+                          (isinstance(x, ast.Name) and x.id == "environ")
+                          for x in ast.walk(n.value))
+            if has_key and has_env:
+                ov_var = n.targets[0].id
+        assert ov_var, (
+            "signin.py 没有从环境变量 SIGNIN_LOG_DIR_OVERRIDE 取值 —— "
+            "冒烟测试的 import signin 会把噪音写进真实按天日志")
+
+        # 2) LOG_DIR 必须引用上面那个变量（否则重定向不生效）
+        ok = False
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name) and t.id == "LOG_DIR":
+                        for sub in ast.walk(n.value):
+                            if isinstance(sub, ast.Name) and sub.id == ov_var:
+                                ok = True
+        assert ok, (
+            "LOG_DIR 没有引用 %s —— 环境变量设了也不起作用（重定向形同虚设）" % ov_var)
+
+        # 3) 必须是"有覆盖才用覆盖，否则走 config"的条件式，不能无条件用覆盖
+        logdir_val = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name) and t.id == "LOG_DIR":
+                        logdir_val = n.value
+        assert isinstance(logdir_val, ast.IfExp), (
+            "LOG_DIR 必须是条件式（有覆盖才用覆盖，否则走 config），"
+            "实际是 %s —— 无条件用覆盖会让正常运行也写错目录" % type(logdir_val).__name__)
+
+        return ("signin.py 由 %s 读环境变量，LOG_DIR 条件式引用它"
+                "（未设变量时走 config，正常运行不受影响）" % ov_var)
+
+    def all_imports_guarded():
+        src = open(os.path.join(HERE, "smoke_test.py"), encoding="utf-8").read()
+        tree = ast.parse(src)
+
+        # 收集所有"对环境变量赋值"的位置：os.environ["SIGNIN_LOG_DIR_OVERRIDE"] = ...
+        set_lines = []
+        for n in ast.walk(tree):
+            if not isinstance(n, ast.Assign):
+                continue
+            for t in n.targets:
+                if isinstance(t, ast.Subscript):
+                    try:
+                        key = t.slice.value
+                    except AttributeError:
+                        continue
+                    if key == "SIGNIN_LOG_DIR_OVERRIDE":
+                        set_lines.append(n.lineno)
+
+        # 收集所有 import signin 的位置
+        imp_lines = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                for a in n.names:
+                    if a.name == "signin":
+                        imp_lines.append(n.lineno)
+            elif isinstance(n, ast.ImportFrom) and n.module == "signin":
+                imp_lines.append(n.lineno)
+
+        assert imp_lines, (
+            "smoke_test.py 里找不到 import signin？（文件结构变了，请复核本断言）")
+
+        # 每个 import 都必须被**自己那一处** env 赋值保护：
+        # 在它上方"最近的一段"里存在赋值语句，且两者之间没有别的 import
+        # （否则"全局只要有一个赋值"就能骗过检查 —— 本测试第二版就栽在这）。
+        # 距离上限取 12 行：赋值紧邻 import（实测 1~5 行），留足余量但不过宽。
+        bad = []
+        for ln in sorted(imp_lines):
+            prev_imp = max([x for x in imp_lines if x < ln], default=0)
+            guarded = any(prev_imp < s < ln and (ln - s) <= 12 for s in set_lines)
+            if not guarded:
+                bad.append(ln)
+        assert not bad, (
+            "smoke_test.py 第 %s 行的 `import signin` 附近（上方 12 行内、且中间"
+            "没有别的 import）没有 SIGNIN_LOG_DIR_OVERRIDE 的**真实赋值语句**"
+            "（AST 实测）—— 该处会把噪音写进真实按天日志。"
+            "注意：只在注释里提这个名字不算数。" % ", ".join(str(x) for x in bad))
+        return ("%d 处 import signin 之前都有真实的 env 赋值（AST 实测，"
+                "不受注释干扰）；共 %d 处赋值" % (len(imp_lines), len(set_lines)))
+
+    check("测试防污染：signin 支持日志重定向", override_supported)
+    check("测试防污染：所有 import signin 处已加保护", all_imports_guarded)
+
+    def real_log_has_no_test_noise():
+        """真实按天日志里不得出现**测试特征串**（2026-09-16 新增）。
+
+        【先说清楚这条断言能测什么、不能测什么】
+          第一版我写成"触发一次 history 告警，看真实日志字节数是否变化"。
+          **负向测试证明它是摆设**：把 `child.propagate = False` 删掉、
+          把字节数核对改成 `if False:`、把触发告警那行删掉 —— **三种改坏全 PASS**。
+          原因（实测）：`smoke_test.py` 的每处 `import signin` 之前都设了
+          `SIGNIN_LOG_DIR_OVERRIDE`，于是 `signin` 的三个 handler
+          （run.log / 按天日志 / stdout）**全部指向临时目录** ——
+          真实 `logs/` 在那个进程里根本收不到任何东西。
+          所以"触发告警看它漏不漏"验证的是一个**当前不可能发生**的场景，
+          那种断言无论怎么改坏都会 PASS，价值为零。
+
+        【本判据改为核对"已落盘的事实"】
+          直接扫真实按天日志的**内容**：只要出现测试专属特征串，就是污染。
+          这些特征串真实运行绝不会产生：
+            - `smoke_`     ：临时目录前缀（smoke_basedir_ / smoke_ocrlog_ / smoke_wrlog_）
+            - `[测试]`      ：测试自己写的标记
+            - `Temp\\probe_`：诊断脚本的临时目录
+          这能拦住所有"测试污染"的现实路径，不管它是从哪个 import 溜进去的 ——
+          而且它**会 FAIL**（只要有污染），不是恒真断言。
+
+        【实测佐证】当天日志里 74 行 `smoke_basedir_*` 就是这么被发现的；
+        本轮修复后连跑 10 次，计数从 74 保持不动（无新增）。
+        """
+        real_log = os.path.join(HERE, "logs",
+                                "signin_%s.log" % datetime.now().strftime("%Y%m%d"))
+        if not os.path.isfile(real_log):
+            return "今天还没有真实运行日志，跳过（无污染可查）"
+
+        marks = ("smoke_", "[测试]", "probe_")
+        hits = []
+        with open(real_log, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f, 1):
+                for m in marks:
+                    if m in line:
+                        hits.append((i, m, line.strip()[:110]))
+                        break
+
+        if hits:
+            show = "\n".join("    行 %d（%r）：%s" % (i, m, t) for i, m, t in hits[:5])
+            raise AssertionError(
+                "真实按天日志 %s 里有 %d 行**测试特征串** —— "
+                "测试把噪音写进了排查故障的一级证据里：\n%s\n"
+                "    修法：该 import signin 处必须设 SIGNIN_LOG_DIR_OVERRIDE；"
+                "其它写日志的路径也要一并重定向。"
+                % (os.path.basename(real_log), len(hits), show))
+
+        return ("真实按天日志无测试特征串（%s 逐行扫 smoke_/[测试]/probe_ 三类前缀，"
+                "命中 0 处）" % os.path.basename(real_log))
+
+    check("测试防污染：真实按天日志无测试特征串", real_log_has_no_test_noise)
+
+
 def main():
     print("=" * 60)
     print("油学通签到系统 · 冒烟测试（离线，不会碰微信）")
@@ -3138,8 +3617,11 @@ def main():
     test_bat_encoding_consistency()
     test_self_heal_state_durability()
     test_no_unclosed_response_handles()
+    test_white_screen_semantics()
+    test_cdp_portal_hijack_detection()
     test_match_geometry_guard()
     test_enter_wechat_verifies_click()
+    test_smoke_test_does_not_pollute_real_logs()
 
     print("\n" + "=" * 60)
     print("通过 %d 项，失败 %d 项" % (len(PASSED), len(FAILED)))

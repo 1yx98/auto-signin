@@ -177,7 +177,21 @@ def before_signin_start():
     return now.hour * 60 + now.minute < hhm
 
 
-LOG_DIR = abs_path(CONFIG["log_dir"])
+# 【2026-09-16 新增·防测试污染】允许用环境变量把日志目录重定向到临时位置。
+#
+# 为什么需要这个：
+#   `smoke_test.py` 里有两处 OCR 测试为了拿 `signin._ocr_get_engine()` 必须
+#   `import signin`，而 import 的副作用是**建 run 目录 + 往按天日志写两行**
+#   （"[归档] 本次运行目录..." + "[OCR] 引擎就绪..."）。
+#   实测后果：跑 8 次冒烟测试就往日志里灌了 50 行 `smoke_basedir_*` 噪音，
+#   而**按天日志是排查故障的一级依据**（见 MEMORY："证据和现场是两份东西"）——
+#   测试把噪音写进证据里，会让人在翻真实运行记录时先撞上一堆假条目。
+#   这类"我的工具污染了我要排查的证据"很难事后发现，所以要在源头堵死。
+#
+# 用法：只在测试里设 SIGNIN_LOG_DIR_OVERRIDE=<临时目录>。
+# **正常运行时该变量不存在，行为与之前完全一致**（走 config 的 log_dir）。
+_LOG_DIR_OVERRIDE = os.environ.get("SIGNIN_LOG_DIR_OVERRIDE", "").strip()
+LOG_DIR = _LOG_DIR_OVERRIDE if _LOG_DIR_OVERRIDE else abs_path(CONFIG["log_dir"])
 CONFIDENCE = CONFIG.get("confidence", 0.8)
 SHUTDOWN_DELAY = CONFIG.get("shutdown_delay", 60)
 SHUTDOWN_AFTER_SUCCESS = CONFIG.get("shutdown_after_success", True)
@@ -1551,9 +1565,30 @@ def step_enter_wechat(allow_restart=True):
         # 现在**必须**用界面依据否证：按钮仍在 → 没进去。
         # 注意：此处的复核**不**传 must_be_in —— 此刻我们就是要问
         # "这按钮还在不在屏幕上任何地方"，越界与否不重要。
-        c2, x2, y2 = match(ENTER_WECHAT_BTN, scales=(0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15))
-        if c2 >= 0.8:
-            logger.error(f"[进入微信] 点击后仍停留'进入微信'页（按钮仍在 conf={c2:.3f} "
+        #
+        # 【2026-09-16 二次加固·误判风险】只查一次是危险的：
+        #   点击后窗口要重建（日志实测 sleep 6s 才稳），冷启动/机器卡时
+        #   按钮可能**还在淡出过程中**，此时复核会得到高分 → **把成功误判成失败**。
+        #   这个方向比"漏判"更糟：它会让本来能成的签到被判死（假失败）。
+        # 所以改成**多试几次、只要有一次确认按钮消失了就放行**：
+        #   这与"等它消失"的语义一致 —— 我们要证否的是"按钮一直在"，
+        #   而不是"6 秒整那一刻按钮不在"。
+        # 每轮间隔 1.5s，最多 4 轮（约 +6s），总耗时与原来相当。
+        # 只有**4 轮全都在高分命中**时才判失败（真正顽固地留在登录页）。
+        _still_there = None
+        for _vi in range(4):
+            c2, x2, y2 = match(ENTER_WECHAT_BTN,
+                              scales=(0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15))
+            if c2 < 0.8:
+                _still_there = False
+                break
+            _still_there = (c2, x2, y2)
+            if _vi < 3:
+                logger.info(f"[进入微信] 点击后第{_vi+1}次复核仍见按钮(conf={c2:.3f})，稍等再看")
+                time.sleep(1.5)
+        if _still_there is not False:
+            c2, x2, y2 = _still_there
+            logger.error(f"[进入微信] 点击后复核 4 次按钮始终存在（最后一次 conf={c2:.3f} "
                          f"位置({x2},{y2})），说明点击未生效 —— 不再重启微信（避免制造窗口弹跳噪音）")
             shot("FAIL_进入微信点击无效")
             return False

@@ -495,29 +495,83 @@ _JS_STATE = r"""
 """
 
 
+# 校园网门户特征串（与 signin.py 的 PORTAL_MARKERS 保持一致）。
+# 【2026-09-16 修复·漏判门户 → 假成功】原来这里只有 3 个词
+# （"eportal" / "ACSetting" / "Dr.COM"），而 signin.py 用的是 7 个。
+# 少掉的 "DDDDD" / "upass" 恰恰是 Dr.COM 门户**登录表单的字段名** ——
+# 也就是"被劫持到门户页"时最稳定会出现的字眼。
+PORTAL_MARKERS = ("eportal", "ACSetting", "DDDDD", "upass", "Dr.COMWebLogin",
+                  "authloginpath", "authuserfield")
+PORTAL_GATEWAY = "10.123.0.253"
+
+
 def _internet_ok(urls, timeout=4):
+    """是否真的能上外网（而不是被门户劫持）。
+
+    判定"被劫持"必须同时看两处，只看 body 是不够的：
+      1. **最终 URL**：`generate_204` 被 302 到 `10.123.0.253/...` 时，
+         urllib 默认会跟随重定向，于是 `r.status` 是 **200**、body 是门户页 HTML ——
+         如果门户页用的是我们没列举到的模板，body 里一个特征串都没有，
+         原来就会判成"外网已通"。注意 `r.status in (200,204)` 这个条件实际上
+         永远为真（非 2xx 会抛 HTTPError，根本走不到这一行），等于没有校验。
+         这也是 signin.py 的 net_state() 用 `r.geturl()` 查网关的原因。
+      2. **正文特征串**：覆盖门户页模板不固定的情况。
+
+    修正方向是"宁可说'没通'"：判错方向的代价不对称 ——
+    把'已通'误判成'没通'只是多等一轮/多登一次；把'被劫持'误判成'已通'
+    会让上层**报告登录成功**（假成功），后面所有步骤都建立在错误前提上。
+    """
     for u in urls:
         try:
             req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as r:
-                body = r.read(400).decode("utf-8", errors="replace")
-                if r.status in (200, 204) and not any(
-                        m in body for m in ("eportal", "ACSetting", "Dr.COM")):
-                    return True
+                final = r.geturl() or ""
+                body = r.read(65536).decode("utf-8", errors="replace")
+                if PORTAL_GATEWAY in final:
+                    continue        # 被 302 到门户网关 —— 明确未通
+                if any(m in body for m in PORTAL_MARKERS):
+                    continue        # 返回的是门户特征页 —— 明确未通
+                return True
         except Exception:
             continue
     return False
 
 
 def _eval_retry(box, port, expression, timeout=15):
-    """执行 JS；连接断了就重连一次（页面跳转/重载时会发生）。"""
+    """执行 JS；连接断了就重连一次（页面跳转/重载时会发生）。
+
+    【2026-09-16 修复·静默失败 + 句柄泄漏】原来两段 `except Exception` 全都
+    无声 return None，有两个后果：
+
+      ① **旧连接不关**：`_pick_page` 返回 None（页面已跳走/浏览器在退出）时
+         直接把 None 返回，而 `box[0]` 里那个已经坏掉的 _CDP 从未 `close()`，
+         它的 socket 一直挂着。
+      ② **根因被掩盖**（这条更要紧）：调用方拿到 None 后只会看到
+         `state = {}`，于是判断成"页面还没渲染好"，继续 sleep 等下一轮，
+         直到 `wait_form` 超时。日志里最后只有一句"没能识别出登录表单"——
+         **看不出是 WebSocket 断了还是端口没了**，排查方向直接跑偏。
+
+    现在：失败路径**先关掉旧连接**（避免泄漏），并把原因交给 `_log`
+    记一条可诊断的日志。返回值语义不变（仍返回 None 表示"这次没拿到"），
+    不改变调用方的控制流 —— 只是让"为什么没拿到"留下痕迹。
+    """
+    if box[0] is None:
+        # 上一轮重连已判定"页面不可达"，这里不再徒劳重试，也不再刷重复日志
+        return None
     try:
         return box[0].eval(expression, timeout=timeout)
-    except Exception:
-        pass
+    except Exception as _e1:
+        _log(f"CDP 执行失败，准备重连: {type(_e1).__name__}: {_e1}")
     try:
-        t = _pick_page(port, want_substr="10.123.0.253", tries=3) or _pick_page(port, None, tries=3)
+        t = _pick_page(port, want_substr=PORTAL_GATEWAY, tries=3) or _pick_page(port, None, tries=3)
         if not t:
+            # 连目标页面都找不到：先把旧连接关掉（这是原来漏掉的那一步）
+            try:
+                box[0].close()
+            except Exception:
+                pass
+            box[0] = None
+            _log("CDP 重连失败：已找不到可连接的页面（浏览器可能已退出）")
             return None
         try:
             box[0].close()
@@ -526,7 +580,8 @@ def _eval_retry(box, port, expression, timeout=15):
         box[0] = _CDP(t["webSocketDebuggerUrl"], fallback_port=port)
         box[0].call("Runtime.enable", timeout=10)
         return box[0].eval(expression, timeout=timeout)
-    except Exception:
+    except Exception as _e2:
+        _log(f"CDP 重连后仍失败: {type(_e2).__name__}: {_e2}")
         return None
 
 
