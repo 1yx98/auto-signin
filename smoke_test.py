@@ -2034,6 +2034,181 @@ def test_ocr_negative_stems_veto():
     check("OCR: 否定词残缺形态（骨架）也能否决，且不误伤正向词", _run)
 
 
+def test_ended_record_propagates_not_time():
+    """【2026-09-16 新增】OCR 读出的「已结束」必须传到决策层并判 not_time，不能被当成导航失败。
+
+    背景（用户 2026-09-16 反馈的真实现象，日志实证 3 次）：
+      用户每天 20:50 才收到学校的晚点名推送。在此之前打开详情页，看到的是
+      **昨天那条记录的「已结束」**。这是"今天还没开始"的**正常**状态，不是故障。
+      但脚本判成了 fail + 退出码 1 + 留失败现场 + 发飞书告警 + 记自愈失败。
+
+    真根因（不是时间守卫失效，是**证据在途中被丢弃**）：
+      signed_detail_button() 只有"按钮dict / None"两种返回，无法区分
+        a) 页面上没有符合几何的灰宽按钮
+        b) 几何像但字迹不像
+        c) 几何像、字迹也像，但 **OCR 明确读出「已结束」**
+      三者在调用方 find_and_click_entry 眼里**长得一模一样**，于是 (c) 被当成
+      "没找到入口" → `return False` → attempt_once 记 NAV_ENTRY_FAIL → fail。
+
+    铁证（logs/signin_20260916.log 16:34:03，三行紧挨着）：
+      [已签到判据] 几何 + 字迹双路一致 → 字迹符合「已签到」
+      [OCR] 详情页按钮文字=「已结束」含否定词「已结束」→ **否决**'已签到'判定
+      [导航] 第4步「每日签到里的进入按钮」滚动后仍未找到，终止     ← 证据到这里就没了
+
+    修复：给 signed_detail_button 加可选 out 出参，把"读到否定词"这个事实带出去；
+          导航层据此返回 "not_time"（沿 3399 行既有链路 → 退出码 3、不告警、不留现场）。
+
+    本断言锁死三层（缺任何一层，修复都会被静默撤销）：
+      ① AST：out 参数存在，且**真的被赋值**（不是只在签名里占位）
+      ② AST：导航层**真的**读了 _out.get("negative") 并返回 "not_time"
+      ③ 运行时：不传 out 时行为与改动前完全一致（防"顺手改坏老路径"）
+
+    为什么必须用 AST 判 ①②：注释里就写着"应该返回 not_time"这句话，
+    用字符串搜索必然命中注释 → 断言恒真成摆设。本项目已因这类错误栽过三次。
+    """
+    def _run():
+        p = os.path.join(HERE, "signin.py")
+        with open(p, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src, filename="signin.py")
+
+        fn = None
+        for n in tree.body:
+            if isinstance(n, ast.FunctionDef) and n.name == "signed_detail_button":
+                fn = n
+                break
+        if fn is None:
+            raise AssertionError("找不到 signed_detail_button")
+
+        # ---- ① out 参数存在，且被真实赋值过 ----
+        argnames = [a.arg for a in fn.args.args]
+        if "out" not in argnames:
+            raise AssertionError(
+                "signed_detail_button 缺少 out 出参 —— 「已结束」证据无法传到调用方，"
+                "会退回『正常状态被误报为失败』的老 bug")
+
+        # 找 `out["negative"] = True` 这类赋值（AST 查真节点，不看注释）
+        assigned_true = []
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign) and len(n.targets) == 1:
+                tgt = n.targets[0]
+                if (isinstance(tgt, ast.Subscript)
+                        and isinstance(tgt.value, ast.Name)
+                        and tgt.value.id == "out"
+                        and isinstance(n.value, ast.Constant)
+                        and n.value.value is True):
+                    assigned_true.append(n.lineno)
+        if not assigned_true:
+            raise AssertionError(
+                "signed_detail_button 里没有 `out[...] = True` 的赋值 —— "
+                "参数只是个占位符，证据依然带不出去")
+
+        # 这个赋值必须发生在 OCR 否决分支内（不能随便找个地方赋）
+        veto_lns = []
+        for n in ast.walk(fn):
+            if isinstance(n, ast.If):
+                seg = ast.get_source_segment(src, n.test) or ""
+                if "_v is False" in seg or ("ocr_veto_signed" in (ast.get_source_segment(src, n) or "")
+                                            and "_v" in seg):
+                    veto_lns.append(n.lineno)
+        if not veto_lns:
+            raise AssertionError("找不到 OCR 否决分支（_v is False）")
+        if not any(v <= a for v in veto_lns for a in assigned_true):
+            raise AssertionError(
+                "`out[...] = True` 不在 OCR 否决分支内 —— "
+                "那会把『字迹不符』也记成『读到已结束』，反而制造新的误报")
+
+        # ---- ② 导航层真的读了这个出参并返回 not_time ----
+        navf = None
+        for n in tree.body:
+            if isinstance(n, ast.FunctionDef) and n.name == "open_signin_entry":
+                navf = n
+                break
+        if navf is None:
+            raise AssertionError("找不到 open_signin_entry")
+
+        # 传了 out= 关键字（否则 signed_detail_button 根本不会写）
+        passed_out = False
+        for n in ast.walk(navf):
+            if isinstance(n, ast.Call):
+                if any(k.arg == "out" for k in n.keywords):
+                    passed_out = True
+                    break
+        if not passed_out:
+            raise AssertionError(
+                "open_signin_entry 调用 signed_detail_button 时没传 out= —— "
+                "出参永远是空的，修复等于没做")
+
+        # 必须有 `if <...>.get("negative"):` 且其函数体里有 return "not_time"
+        found_guard = None
+        for n in ast.walk(navf):
+            if isinstance(n, ast.If):
+                seg = ast.get_source_segment(src, n.test) or ""
+                if 'get("negative")' in seg:
+                    found_guard = n
+                    break
+        if found_guard is None:
+            raise AssertionError(
+                'open_signin_entry 里没有 `if ....get("negative"):` 判据 —— '
+                "读到了反而不处理，证据还是白读了")
+        rets = [r.value.value for r in ast.walk(found_guard)
+                if isinstance(r, ast.Return) and isinstance(r.value, ast.Constant)
+                and isinstance(r.value.value, str)]
+        if "not_time" not in rets:
+            raise AssertionError(
+                'out.get("negative") 分支里没有 return "not_time"（实际返回：%s）—— '
+                "会退回判 fail 的老毛病" % rets)
+
+        # ---- ③ 运行时：不传 out 的行为必须与改动前一致 ----
+        # 用 AST 取真函数源码执行，不复制粘贴实现（防"测试版与线上版各写一套"）
+        ns = {}
+        fake = {
+            "win_rect": lambda hwnd: (5, 0, 1123, 1715),
+            "button_stylometry": lambda full, x: {"bg": 204, "contrast": 25,
+                                                  "ink": 0.0239, "polarity": "light"},
+            "is_already_signed_style": lambda st: (True, "模拟"),
+            "logger": logging.getLogger("smoke_detail"),
+        }
+        ns.update(fake)
+        mod = ast.Module(body=[fn], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(mod), "<signed_detail_button>", "exec"), ns)
+        run = ns["signed_detail_button"]
+
+        cy = 0 + int(0.72 * 1715)
+        btn = {"kind": "gray", "cx": 545, "cy": cy, "w": 838, "h": 90}
+
+        ns["ocr_veto_signed"] = lambda full, x, tag="": False   # 读到「已结束」
+        r_old = run(1, [btn], full=object())                   # 老调用方式：不传 out
+        if r_old is not None:
+            raise AssertionError("不传 out 时读到否定词竟判成功 —— 假成功防线被破坏")
+        o1 = {}
+        r_new = run(1, [btn], full=object(), out=o1)
+        if r_new is not None:
+            raise AssertionError("传 out 时读到否定词仍判成功 —— 防线被破坏")
+        if o1.get("negative") is not True:
+            raise AssertionError('读到「已结束」但 out["negative"] 不是 True：%r' % o1)
+
+        ns["ocr_veto_signed"] = lambda full, x, tag="": True    # 读到「已签到」
+        o2 = {}
+        r2 = run(1, [btn], full=object(), out=o2)
+        if r2 is not btn:
+            raise AssertionError("读到「已签到」却没返回按钮（正常成功路径被破坏）")
+        if o2.get("negative") is not False:
+            raise AssertionError('读到「已签到」但 out["negative"] 不是 False：%r' % o2)
+
+        ns["ocr_veto_signed"] = lambda full, x, tag="": None    # 读不出（最常见）
+        o3 = {}
+        r3 = run(1, [btn], full=object(), out=o3)
+        if r3 is not btn:
+            raise AssertionError("OCR 读不出时没有放行 —— veto-only 设计被破坏")
+        if o3.get("negative") is not False:
+            raise AssertionError('读不出却把 out["negative"] 置 True —— 会大量误报 not_time')
+
+        return ("out 出参存在且仅在 OCR 否决时置 True；导航层读它并返回 not_time；"
+                "不传 out 时行为不变（AST + 运行时双证）")
+    check("「已结束」证据必须传到决策层并判 not_time（不被当成导航失败）", _run)
+
+
 def test_wifi_link_connected():
     """【2026-09-16 新增】WiFi 链路状态判据必须是「白名单精确匹配」，不能是子串匹配。
 
@@ -3608,6 +3783,7 @@ def main():
     test_ocr_no_reverse_misread()
     test_ocr_best_initialized()
     test_ocr_negative_stems_veto()
+    test_ended_record_propagates_not_time()
     test_wifi_link_connected()
     test_global_timeout_guards_long_waits()
     test_prune_visible_and_sideeffect_free()

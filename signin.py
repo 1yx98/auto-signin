@@ -2253,7 +2253,19 @@ def open_signin_entry():
             if hh:
                 _cap = []
                 _btns = scan_buttons(hh, grab_full=_cap)
-                if signed_detail_button(hh, _btns, full=(_cap[0] if _cap else None)):
+                # 【2026-09-16 修复·"已结束"证据在导航层被丢弃】
+                # 真实日志实证（16:32/16:34/16:38 三次运行，均为"推送还没来、
+                # 详情页停在昨天那条已结束记录"的正常情况）：
+                #   [已签到判据] 几何 + 字迹双路一致 → 字迹符合「已签到」
+                #   [OCR] 详情页按钮文字=「已结束」含否定词「已结束」→ 否决
+                #   [导航] 第4步「每日签到里的进入按钮」滚动后仍未找到，终止   ← 问题在这里
+                # OCR 明明读出了「已结束」，但 signed_detail_button 只能回 None，
+                # 导航层把它当成"没找到入口"→ return False → 整轮判 fail。
+                # 于是"时间没到、今天还没推送"这个**完全正常**的状态被误报成"签到失败"，
+                # 还留了失败现场 + 发飞书告警 + 记自愈失败，全部是噪音。
+                # 现在用 out 出参把 OCR 的否决意图接出来，明确转成 not_time。
+                _out = {}
+                if signed_detail_button(hh, _btns, full=(_cap[0] if _cap else None), out=_out):
                     # 时间守卫：签到开始前检测到灰色'已签到'，极可能是昨天的记录
                     if before_signin_start():
                         logger.info(f"[导航] 第{i+1}步「{name}」未找到'进入按钮'，但检测到灰色'已签到'——签到未开始，这是昨天的记录，返回 not_time")
@@ -2262,6 +2274,16 @@ def open_signin_entry():
                     logger.info(f"[导航] 第{i+1}步「{name}」未找到'进入按钮'，但详情页已是灰色'已签到'（重进刷新成功），视为已到达")
                     shot(f"nav{i+1}_{name}_已签到态")
                     return True
+                if _out.get("negative"):
+                    # OCR 明确读到「已结束/未开始/不在区域内」等否定词。
+                    # 这不是"导航失败"，而是"页面上就是一条历史/未开放记录"——
+                    # 对脚本而言属于 not_time（正常，等推送/等时段），必须原样上报，
+                    # 绝不能当成 fail（那会把正常状态误报成故障，还会留下无意义的失败现场）。
+                    logger.warning(f"[导航] 第{i+1}步「{name}」未找到'进入按钮'，"
+                                   f"且 OCR 读到否定词（历史/未开放记录）——"
+                                   f"判定为 not_time（不是失败；通常是今日签到尚未推送）")
+                    shot(f"nav{i+1}_{name}_已结束或未开始")
+                    return "not_time"
                 # "未开始"状态：不在签到时段，详情页只有绿色"请假"按钮，没有蓝色"进入"按钮。
                 # 此时不应判失败，应返回 not_time（正常现象，等签到时段再跑）。
                 _has_blue = any(b["kind"] == "blue" for b in _btns)
@@ -2854,7 +2876,7 @@ def is_already_signed_style(st):
     return True, "字迹符合「已签到」(%s)" % desc
 
 
-def signed_detail_button(hwnd, btns, full=None, verify=True):
+def signed_detail_button(hwnd, btns, full=None, verify=True, out=None):
     """判断当前是否为'已签到'详情页（签到成功的硬依据）。
 
     【2026-09-15 改造：三路判据 + 交集】
@@ -2866,7 +2888,29 @@ def signed_detail_button(hwnd, btns, full=None, verify=True):
     verify=False 可跳过第二/三路（仅用于性能敏感或明确不需要的场合）。
 
     返回该灰色按钮 dict；不是已签详情页则返回 None。
+
+    【2026-09-16 新增·out 出参：把"为什么不是"带出去】
+    ------------------------------------------------
+    问题（真实日志实证，见 16:32/16:34/16:38 三次运行）：
+      函数原来只有"按钮dict / None"两种返回，**无法区分**这几种完全不同的情形——
+        a) 页面上压根没有符合几何的灰宽按钮（真的没到那一步）
+        b) 几何像、字迹不像（形态不符）
+        c) **几何像、字迹也像，但 OCR 明确读出「已结束」**（=昨天残留记录）
+      三者都返回 None。调用方 `find_and_click_entry` 于是把 (c) 也当成
+      "没找到入口" → `return False` → 整轮判 fail。
+      后果：**OCR 好不容易认出「已结束」，这条最关键的证据在导航层就被丢掉了**，
+      决策层只看到"导航失败"，于是把"时间没到（正常）"误报成"签到失败（故障）"。
+      这正是用户 2026-09-16 反馈的现象：不在签到时段跑，本该 not_time，实际是 fail。
+
+    修法：加 `out` 出参（dict），把"读到否定词"这个事实原样传出去。
+      · out 为 None（默认）→ 行为与改动前**完全一致**（不新增任何分支）
+      · 传入 dict 时，会在其中写入 {"negative": True} 表示 OCR 读到了否定词
+      刻意做成"可选出参"而不是"改返回值"：返回值语义被多处依赖，
+      改它等于让所有调用点重新做判断，风险远大于收益。
     """
+    if out is not None:
+        out.clear()
+        out["negative"] = False
     kinds = [x["kind"] for x in btns]
     if "blue" in kinds or "green" in kinds:   # 详情页未签是 蓝签到+绿请假；已签两者都消失
         return None
@@ -2896,6 +2940,13 @@ def signed_detail_button(hwnd, btns, full=None, verify=True):
                 # 读到「已结束」等否定词 → 推翻判定。这正是我们要防的假成功。
                 logger.warning("[已签到判据] OCR 读到否定词，**推翻**'已签到'判定"
                                "（几何+字迹都像，只有文字能分辨，故必须听它的）")
+                # 【2026-09-16 新增】把"读到否定词"这个事实带出去给调用方。
+                # 必须在这里记而不是在函数末尾统一记：只有真正走到 OCR 否决的
+                # 那一个按钮才算数，别的分支（几何不符/字迹不符）不能算。
+                # 不记录文字本身——它已经由上面的 logger.warning 写进 run.log，
+                # 这里再存一份等于制造第二个副本，反而会随时间不一致。
+                if out is not None:
+                    out["negative"] = True
                 continue
             if _v is True:
                 logger.info("[已签到判据] 三路一致（几何 + 字迹 + OCR 文字）→ 证据充分")
