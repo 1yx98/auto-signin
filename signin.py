@@ -1127,9 +1127,35 @@ def cv_read(path):
         return None
 
 
-def match(tpl_path, roi=None, scales=None):
+def match(tpl_path, roi=None, scales=None, must_be_in=None, tag=""):
     """返回(置信度,中心x,中心y)。roi=(x1,y1,x2,y2)只在该区域找（坐标换算回全屏）。
-    scales=(...)时对模板做多尺度匹配取全局最优，适配微信窗口大小不固定。"""
+    scales=(...)时对模板做多尺度匹配取全局最优，适配微信窗口大小不固定。
+
+    【2026-09-16 新增·P0-1】**must_be_in**：命中点必须落在给定矩形内，否则判为"没找到"。
+
+    到底在防什么（真实事故，2026-09-16 12:33）：
+      微信有**两个** Qt 顶层窗口，标题不同——
+        · 标题「微信」  → 已登录后的主界面窗口（本次 1118x1715，当时代码选中的就是它）
+        · 标题「Weixin」→ 登录/托盘窗口
+      `step_enter_wechat` 先 `activate("微信", exact=True)` 选中 918282
+      （标题恰为「微信」，但 WS_VISIBLE=否 —— 是个没显示的幽灵窗），
+      紧接着调 `match(ENTER_WECHAT_BTN)` **不传 roi** → 在**整屏**搜索 →
+      命中的是**另一个窗口**里的「进入微信」按钮，中心 (1430,1053)。
+      而选中窗口 rect=(4,0,1122,1715) 右边界只有 1122 ——
+      **命中点 x=1430 越界 308px，落在那个窗口之外**。
+      脚本照样 `pyautogui.click(1430,1053)`：点击送到了没被激活的窗口上 → 不生效。
+      随后 wait_wechat_rendered 只判白屏（登录页不是白屏）→ 误报"已就绪" →
+      一路走到搜索框才发现 conf=0.446 → 反复重启微信（用户看到的"任务栏弹窗口"）。
+
+    为什么用"几何校验"而不是"改成传 roi"：
+      传 roi 会改变匹配行为（ROI 内可能根本搜不到 & 不同尺度表现不同），
+      属于**改变功能**，风险高；而几何校验只把"明显不可能"的命中降级为"没找到"，
+      不改变能找到的情况。**宁可判"没找到"走重试，也绝不盲点一个越界坐标**
+      —— 这与本项目"失败要暴露不能掩盖"一致：越界本身就是"选错窗口"的信号。
+
+    must_be_in=(x1,y1,x2,y2)：None 表示不校验（保持旧行为，向后兼容）。
+      命中点不在该矩形内 → 返回 (-1.0, None, None)，并打 warning。
+    """
     if not os.path.exists(tpl_path):
         return -1.0, None, None
     tpl = cv_read(tpl_path)
@@ -1160,6 +1186,17 @@ def match(tpl_path, roi=None, scales=None):
         cand = (float(mv), ox + int(ml[0]) + nw // 2, oy + int(ml[1]) + nh // 2)
         if cand[0] > best[0]:
             best = cand
+
+    # 【P0-1】几何校验：命中点必须在期望窗口内
+    if best[1] is not None and must_be_in:
+        bx1, by1, bx2, by2 = must_be_in
+        if not (bx1 <= best[1] <= bx2 and by1 <= best[2] <= by2):
+            who = f" {tag}" if tag else ""
+            logger.warning(
+                "[匹配]%s 命中点(%d,%d) conf=%.3f 落在期望窗口%s之外，"
+                "判定为'没找到'（拒绝盲点越界坐标，避免点到别的窗口上）"
+                % (who, best[1], best[2], best[0], (bx1, by1, bx2, by2)))
+            return -1.0, None, None
     return best
 
 def match_topmost(tpl_path, roi=None, scales=None, rel_gap=0.06):
@@ -1455,26 +1492,71 @@ def _normalize_wechat_size(hwnd, tag=""):
 
 
 def step_enter_wechat(allow_restart=True):
-    """若停在'进入微信'确认页则点进去；等待主界面真正渲染（非白屏）；再关闭'更新说明'弹窗。"""
+    """若停在'进入微信'确认页则点进去；等待主界面真正渲染（非白屏）；再关闭'更新说明'弹窗。
+
+    【2026-09-16 修复·P0-1/P0-2】本次事故的两个缺陷都在这一个函数里：
+      P0-1 选错窗口 + 盲点越界坐标（见 match() 的 must_be_in 注释）
+      P0-2 点击后**没有验证**，wait_wechat_rendered 只判白屏 → 假"已就绪"
+    下面分别加固。
+    """
     hw0 = activate("微信", exact=True)
     # 微信4.x关闭主窗后会隐藏到托盘：窗口句柄还在但 IsWindowVisible=False，或进程在但无主窗。
     # 这种状态 ShowWindow/再次运行唤起都不可靠，9/9 验证：杀进程重启最可靠。
-    _hidden = (hw0 and not user32.IsWindowVisible(hw0)) or (not hw0 and wechat_running())
+    #
+    # 【P0-2·2026-09-16 修复】原来的判据是：
+    #     _hidden = (hw0 and not IsWindowVisible(hw0)) or (not hw0 and wechat_running())
+    # 本次日志里出现了反例：`激活后前台='微信' 可见=0 最小化=0`
+    # —— 前台窗口的标题**就是「微信」**，说明这个窗口其实已经被置到前台了，
+    #    只是我们读到的 WS_VISIBLE 位为 0（微信 4.x Qt 窗口的可见性位在跨进程读取时
+    #    本来就不可靠）。旧判据据此**杀掉微信重启**，代价约 40 秒且引入状态混乱，
+    #    而日志紧接着就匹配到了「进入微信」按钮 conf=0.999 —— 界面明明好着。
+    # 这与 client_white_ratio 那次的教训是同一个类型：
+    #    **"读不到"不等于"坏的"，不能因为读不到就付"杀掉重启"这种高代价动作。**
+    # 新判据：只有"窗口句柄存在但既不可见、又没被置到前台"时，才认定为真·隐藏到托盘。
+    # 若它已经是前台窗口，说明状态可用，交给下面的模板匹配去判断。
+    _is_fg = hw0 and (fg_title() == "微信")
+    _hidden = (hw0 and not user32.IsWindowVisible(hw0) and not _is_fg) or (not hw0 and wechat_running())
     if _hidden:
-        logger.info("[进入微信] 微信隐藏到托盘（不可见或无主窗），杀进程重启（最可靠）")
+        logger.info("[进入微信] 微信隐藏到托盘（不可见且未置前台），杀进程重启（最可靠）")
         kill_wechat()
         if not start_wechat():
             logger.error("[进入微信] 重启微信失败")
             return False
         hw0 = activate("微信", exact=True)
-    activate("微信", exact=True)
-    c, x, y = match(ENTER_WECHAT_BTN, scales=(0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15))
-    logger.info(f"[进入微信] 检测确认页按钮 conf={c:.3f}")
+    hw0 = activate("微信", exact=True)
+
+    # 【P0-1】先取当前选中窗口的矩形，作为"命中点必须落在其中"的边界。
+    # 注意 rect 可能带 -32000 哨兵（最小化/已销毁），此时不启用校验（避免误杀正常情况）。
+    _bounds = None
+    if hw0:
+        _l, _t, _r, _b = win_rect(hw0)
+        if _l > -30000 and _t > -30000 and _r > _l and _b > _t:
+            _bounds = (_l, _t, _r, _b)
+
+    c, x, y = match(ENTER_WECHAT_BTN, scales=(0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15),
+                    must_be_in=_bounds, tag="[进入微信]")
+    logger.info(f"[进入微信] 检测确认页按钮 conf={c:.3f}"
+                + (f" 边界={_bounds}" if _bounds else ""))
     if c >= 0.8:
-        activate("微信", exact=True)
         logger.info(f"[进入微信] 停在确认页，点击({x},{y})进入")
+        # 点击前再激活一次（旧代码是在点击前 activate，这里保留但挪到紧邻点击处）
+        activate("微信", exact=True)
         pyautogui.click(x, y)
         time.sleep(6)  # 进入后窗口句柄重建
+
+        # 【P0-2】真正验证"有没有点进去"：再看一次那个按钮还在不在。
+        # 原来的 wait_wechat_rendered 只判白屏，而**登录页不是白屏** →
+        # 它会立刻返回"已就绪"，脚本完全失去发现"没进去"的能力，
+        # 一路错到搜索框那步才报 conf=0.446，然后反复重启微信。
+        # 现在**必须**用界面依据否证：按钮仍在 → 没进去。
+        # 注意：此处的复核**不**传 must_be_in —— 此刻我们就是要问
+        # "这按钮还在不在屏幕上任何地方"，越界与否不重要。
+        c2, x2, y2 = match(ENTER_WECHAT_BTN, scales=(0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15))
+        if c2 >= 0.8:
+            logger.error(f"[进入微信] 点击后仍停留'进入微信'页（按钮仍在 conf={c2:.3f} "
+                         f"位置({x2},{y2})），说明点击未生效 —— 不再重启微信（避免制造窗口弹跳噪音）")
+            shot("FAIL_进入微信点击无效")
+            return False
         h = wait_wechat_rendered(timeout=14, tag="进入微信后")
         if not h and allow_restart:
             return restart_wechat_and_enter()

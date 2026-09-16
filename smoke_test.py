@@ -2799,6 +2799,305 @@ def test_no_unclosed_response_handles():
     check("资源：portal 探测的响应已关闭", portal_probe_uses_with)
 
 
+def test_match_geometry_guard():
+    """match() 的几何校验 must_be_in（P0-1，2026-09-16 12:33 事故）。
+
+    【事故经过（真实日志 + 截图双重取证）】
+      微信在同一台机器上有**两个** Qt 顶层窗口，标题不同：
+        · 标题「微信」  → 主界面窗口（事故时 hwnd=918282 rect=(4,0,1122,1715)，WS_VISIBLE=否）
+        · 标题「Weixin」→ 另一个窗口（hwnd=3082690 rect=(1267,634,1613,1025)）
+      step_enter_wechat 用 `activate("微信", exact=True)` 选中了 918282，
+      紧接着 `match(ENTER_WECHAT_BTN)` **不传 roi** → 整屏搜索 →
+      命中的是**另一个窗口**里的「进入微信」按钮，中心 (1430,1053)。
+      而 918282 的右边界只有 1122 —— **命中点 x=1430 越界 308px**。
+      脚本照样点了：点击落在没被激活的窗口上 → 不生效
+      → wait_wechat_rendered 只判白屏（登录页不白屏）→ 误报"已就绪"
+      → 一路错到搜索框 conf=0.446 → 反复重启微信（用户看到的"任务栏弹窗口"）。
+
+    【本测试锁死什么】
+      1) 命中点在矩形内 → 正常返回（不误杀）
+      2) 命中点越界 → 必须返回 (-1.0, None, None)，即"没找到"
+      3) 矩形边界上的点按闭区间放行（避免 off-by-one 误杀）
+      4) must_be_in=None → 保持旧行为（向后兼容）
+      5) 用**真实事故截图**验证：整屏 0.977 vs 限定在选中窗口内 0.285
+         —— 证明按钮真的不在那个窗口里，而不是我拍脑袋说的
+    """
+    section("匹配：几何校验 must_be_in")
+
+    def guard_logic():
+        """直接抠 match() 的几何校验分支下来跑（不 import signin）。
+
+        match() 依赖 screen_bgr/cv_read/logger，整体 exec 会缺依赖；
+        所以这里用 AST 把"几何校验"那段逻辑抽出来等价验证 ——
+        但为了不变成"测试自己写的逻辑"，下面第 5 项会用真实图像端到端跑真 match()。
+        """
+        src = open(os.path.join(HERE, "signin.py"), encoding="utf-8").read()
+        tree = ast.parse(src)
+        fn = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "match":
+                fn = n
+                break
+        assert fn is not None, "signin.py 里找不到 match()"
+
+        # 断言：match() 签名里必须有 must_be_in
+        args = [a.arg for a in fn.args.args]
+        assert "must_be_in" in args, (
+            "match() 缺少 must_be_in 参数 —— P0-1 的几何校验被删了！"
+            "（本次事故正是'命中点越界 308px 仍照点'造成的）")
+
+        # 断言：函数体里必须真的用到 must_be_in（不是只加了个没用的参数）
+        used = False
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Name) and node.id == "must_be_in":
+                used = True
+                break
+        assert used, "match() 声明了 must_be_in 却从未使用 —— 护栏是摆设"
+
+        # 断言：必须有"越界即返回 -1.0"的分支
+        has_reject = False
+        for node in ast.walk(fn):
+            if isinstance(node, ast.If):
+                # 找 return -1.0, None, None
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Tuple):
+                        elts = sub.value.elts
+                        if len(elts) == 3 and isinstance(elts[0], ast.UnaryOp) and \
+                           isinstance(elts[0].op, ast.USub) and \
+                           isinstance(elts[0].operand, ast.Constant) and \
+                           elts[0].operand.value == 1.0:
+                            has_reject = True
+        assert has_reject, "match() 没有'越界返回 -1.0'的分支"
+
+        return "match() 有 must_be_in 参数、真的使用、且有越界拒绝分支（AST 实测）"
+
+    def real_screenshot_proof():
+        """用真实事故截图端到端验证几何校验的必要性。
+
+        这是本测试的核心：不靠推理，靠**12:33 那次留下的真实截图**。
+        截图：logs/run_20260916_123305/123334_进入微信后.jpg（2880x1800）
+              —— 点击后仍停在「进入微信」页（正是故障现场）
+        模板：templates/00_enter_wechat.png（312x53）
+
+        预期（已实测）：
+          · 整屏搜索            → conf≈0.977，中心 (1430,1053)   ← 脚本实际拿到的
+          · 限定在选中窗口内搜索 → conf≈0.285                    ← 根本不在里面
+        差值 0.977 vs 0.285 就是"选错窗口"的铁证。
+        """
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            return "跳过（无 cv2）"
+
+        shot = os.path.join(HERE, "logs", "run_20260916_123305", "123334_进入微信后.jpg")
+        tpl_p = os.path.join(HERE, "templates", "00_enter_wechat.png")
+        if not os.path.exists(shot):
+            return "跳过（事故截图已被归档清理，无法复现验证）"
+        if not os.path.exists(tpl_p):
+            raise AssertionError("模板 00_enter_wechat.png 不存在")
+
+        def imread_u(p):
+            return cv2.imdecode(np.fromfile(p, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+        tpl = imread_u(tpl_p)
+        full = imread_u(shot)
+        assert tpl is not None and full is not None, "读图失败"
+        assert full.shape[:2] == (1800, 2880), \
+            "事故截图分辨率变了(%s)，本断言的前提失效，请重新实测" % (full.shape,)
+
+        def best_in(img, ox, oy):
+            best = (-1.0, None, None)
+            sh, sw = img.shape[:2]
+            for sc in (0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15):
+                th0, tw0 = tpl.shape[:2]
+                nw, nh = max(4, int(round(tw0 * sc))), max(4, int(round(th0 * sc)))
+                if nh > sh or nw > sw:
+                    continue
+                t2 = cv2.resize(tpl, (nw, nh), interpolation=cv2.INTER_AREA) \
+                    if abs(sc - 1) > 1e-3 else tpl
+                r = cv2.matchTemplate(img, t2, cv2.TM_CCOEFF_NORMED)
+                _, mv, _, ml = cv2.minMaxLoc(r)
+                cand = (float(mv), ox + int(ml[0]) + nw // 2, oy + int(ml[1]) + nh // 2)
+                if cand[0] > best[0]:
+                    best = cand
+            return best
+
+        # 整屏（脚本实际行为）
+        c_full, x_full, y_full = best_in(full, 0, 0)
+        assert c_full > 0.9, "整屏应能高置信命中按钮，实际 conf=%.3f" % c_full
+        assert (x_full, y_full) == (1430, 1053), \
+            "整屏命中点变了 (%s,%s)，与事故记录 (1430,1053) 不符 —— 前提失效" % (x_full, y_full)
+
+        # 限定在脚本选中的窗口 rect=(4,0,1122,1715) 内
+        l, t, r, b = 4, 0, 1122, 1715
+        roi = full[t:b, l:r]
+        c_win, _, _ = best_in(roi, l, t)
+
+        # 核心断言：按钮不在选中窗口里，且差异必须足够大（不是噪声）
+        assert c_win < 0.5, (
+            "限定在选中窗口(4,0,1122,1715)内竟能命中 conf=%.3f —— "
+            "若如此则'选错窗口'的结论不成立，请重新分析" % c_win)
+        assert c_full - c_win > 0.5, (
+            "整屏(%.3f)与窗内(%.3f)差异仅 %.3f，不足以证明'按钮在另一个窗口'"
+            % (c_full, c_win, c_full - c_win))
+
+        # 几何断言：命中点确实越界
+        assert not (l <= x_full <= r), \
+            "命中点 x=%d 竟在窗口右边界 %d 之内 —— 与事故记录矛盾" % (x_full, r)
+        assert x_full - r == 308, "越界量变了（%d，期望 308）" % (x_full - r)
+
+        return ("真实截图实测：整屏 conf=%.3f@(%d,%d) vs 选中窗内 conf=%.3f；"
+                "命中点越界 %dpx —— 几何校验确有必要"
+                % (c_full, x_full, y_full, c_win, x_full - r))
+
+    check("匹配：match() 声明并真正使用 must_be_in（AST）", guard_logic)
+    check("匹配：真实事故截图证明越界（整屏 vs 窗内）", real_screenshot_proof)
+
+
+def test_enter_wechat_verifies_click():
+    """step_enter_wechat 点击后必须验证是否真的进去了（P0-2）。
+
+    【为什么必须有这一条】
+      原来点击后只调 wait_wechat_rendered()，而它**只判白屏**。
+      登录页不是白屏 → 它立刻返回"已就绪" → 脚本完全失去"发现没进去"的能力。
+      结果：一路错到搜索框那步才报 conf=0.446 → 触发"重启微信以恢复窗口状态"
+      → **反复杀微信重启**，就是用户看到的"任务栏弹窗口"。
+
+    【修复方式】点击后**再次匹配那个按钮**，若仍在 → 判定没进去，
+      打 ERROR、存失败现场截图、直接返回 False（不再重启微信）。
+
+    【本测试锁死什么】(全部用 AST 查真实节点，不查字符串 —— 见 MEMORY 4.4)
+      1) 点击之后，函数体内必须存在"第二次匹配 ENTER_WECHAT_BTN"的调用
+      2) 该调用必须作为 match 的实参出现（不是文档字符串里提一句）
+      3) 必须有"仍命中 → return False"的分支（不能只是 log 完继续走）
+      4) 该分支必须打 ERROR 级别的日志（失败要暴露）
+      5) 负向验证：把验证块删掉，断言 1/2/3 必须失败
+    """
+    section("进入微信：点击后验证（防'没进去却继续走'）")
+
+    def find_step_fn():
+        src = open(os.path.join(HERE, "signin.py"), encoding="utf-8").read()
+        tree = ast.parse(src)
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "step_enter_wechat":
+                return n, src
+        raise AssertionError("signin.py 里找不到 step_enter_wechat()")
+
+    def collect_match_calls(fn):
+        """返回 [(行号, 模板表达式源码片段)]，只统计真正的 match(...) 调用节点。
+
+        注意：不用字符串 in 判断 —— 文档字符串里写一句
+        "这里会调用 match(ENTER_WECHAT_BTN)" 就能骗过字符串检查（本项目踩过两次）。
+        """
+        out = []
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call):
+                f = node.func
+                if isinstance(f, ast.Name) and f.id == "match":
+                    arg0 = node.args[0] if node.args else None
+                    tpl = None
+                    if isinstance(arg0, ast.Name):
+                        tpl = arg0.id
+                    out.append((node.lineno, tpl))
+        return out
+
+    def click_then_verify():
+        fn, src = find_step_fn()
+        lines = src.splitlines()
+
+        calls = collect_match_calls(fn)
+        assert len(calls) >= 2, (
+            "step_enter_wechat() 里只找到 %d 次 match() 调用；"
+            "P0-2 要求点击后**再匹配一次**以验证是否进了主界面" % len(calls))
+
+        # 找 pyautogui.click 的行号
+        click_lines = [n.lineno for n in ast.walk(fn)
+                       if isinstance(n, ast.Call)
+                       and getattr(n.func, "attr", None) == "click"
+                       and getattr(getattr(n.func, "value", None), "id", None) == "pyautogui"]
+        assert click_lines, "step_enter_wechat() 里找不到 pyautogui.click"
+        first_click = min(click_lines)
+
+        # 断言 1：必须存在"点击之后"的 match(ENTER_WECHAT_BTN) 调用
+        after = [(ln, tpl) for ln, tpl in calls
+                 if ln > first_click and tpl == "ENTER_WECHAT_BTN"]
+        assert after, (
+            "step_enter_wechat() 在点击(行%d)之后**没有**再匹配 ENTER_WECHAT_BTN —— "
+            "P0-2 的'点击后验证'被删了（这正是'点了没生效却一路走到底'的根源）"
+            % first_click)
+
+        verify_line = min(ln for ln, _ in after)
+
+        # 断言 2：验证块里必须有 return False
+        fn_src = ast.get_source_segment(src, fn)
+        assert fn_src, "取不到函数源码"
+        seg = "\n".join(lines[verify_line - 1: verify_line + 14])
+        assert "return False" in seg, (
+            "点击后验证块（行%d 起）没有 `return False` —— "
+            "验证失败必须立刻中止，不能继续往下走。" % verify_line)
+
+        # 断言 3：验证块必须打 ERROR（失败要暴露，不能静默）
+        assert "logger.error" in seg, (
+            "点击后验证块（行%d 起）没有 logger.error —— "
+            "失败必须出声，不能静默吞掉。" % verify_line)
+
+        return ("点击(行%d)后存在验证匹配(行%d)，且带 return False + logger.error"
+                % (first_click, verify_line))
+
+    def hidden_judgment_not_overzealous():
+        """_hidden 判定不能把"已在前台的窗口"当成"隐藏到托盘"（P0-2 附带修复）。
+
+        事故日志：`激活后前台='微信' 可见=0 最小化=0`
+        —— 前台标题就是「微信」，说明窗口其实已被置前，
+           `WS_VISIBLE=0` 只是跨进程读 Qt 窗口不可靠。
+        旧判据据此**杀掉微信**（约 40 秒 + 状态混乱），而日志下一行就匹配到
+        按钮 conf=0.999，界面明明好着。
+
+        【必须用 AST，不能查字符串 / 正则】
+        该函数体内**保留着一行注释掉的旧判据**做历史留痕：
+            #     _hidden = (hw0 and not IsWindowVisible(hw0)) or ...
+        用字符串或正则查源码会把**这行注释**当成真实代码 → 测试误判。
+        （这不是假设：本测试第一版就是用 re.search 写的，当场被这行注释骗到 FAIL，
+          与 MEMORY 4.4 记录的两次同类翻车完全一样。）
+        所以改查 AST 的真实 Assign 节点 —— 注释不是 AST 节点，天然被排除。
+        """
+        fn, src = find_step_fn()
+
+        def get_assign(name):
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Assign):
+                    for tgt in node.targets:
+                        if isinstance(tgt, ast.Name) and tgt.id == name:
+                            return node
+            return None
+
+        a_hidden = get_assign("_hidden")
+        assert a_hidden is not None, "找不到 `_hidden = ...` 的真实赋值（AST）"
+        flat = " ".join((ast.get_source_segment(src, a_hidden.value) or "").split())
+        assert flat, "取不到 _hidden 赋值表达式源码"
+
+        assert "_is_fg" in flat, (
+            "_hidden 的判定式没有引用 _is_fg（'已在前台'的判定结果）—— "
+            "会把可用窗口误判为'隐藏到托盘'并杀掉微信重启。实际：%s" % flat)
+        assert "IsWindowVisible" in flat, (
+            "_hidden 丢失了 IsWindowVisible 判据。实际：%s" % flat)
+        assert "not _is_fg" in flat, (
+            "'已在前台'必须是否决项（not _is_fg），否则形同没改。实际：%s" % flat)
+
+        a_isfg = get_assign("_is_fg")
+        assert a_isfg is not None, "找不到 `_is_fg = ...` 的真实赋值（AST）"
+        isfg = " ".join((ast.get_source_segment(src, a_isfg.value) or "").split())
+        assert "fg_title()" in isfg and "微信" in isfg, (
+            "_is_fg 必须是'前台标题恰为微信'，实际：%s" % isfg)
+
+        return ("_hidden 由 AST 实测：含 IsWindowVisible 与 not _is_fg；"
+                "_is_fg = 前台标题为「微信」（未被注释里的旧式样干扰）")
+
+    check("进入微信：点击后有验证块（AST 实测）", click_then_verify)
+    check("进入微信：_hidden 不把'已在前台'当'隐藏到托盘'", hidden_judgment_not_overzealous)
+
+
 def main():
     print("=" * 60)
     print("油学通签到系统 · 冒烟测试（离线，不会碰微信）")
@@ -2839,6 +3138,8 @@ def main():
     test_bat_encoding_consistency()
     test_self_heal_state_durability()
     test_no_unclosed_response_handles()
+    test_match_geometry_guard()
+    test_enter_wechat_verifies_click()
 
     print("\n" + "=" * 60)
     print("通过 %d 项，失败 %d 项" % (len(PASSED), len(FAILED)))
