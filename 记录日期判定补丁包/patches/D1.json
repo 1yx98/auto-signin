@@ -1,0 +1,15 @@
+{
+  "title": "注入 _detail_record_is_today() 读页面日期（D2 依赖）",
+  "why": "详情页会显示「签到时间：2026-09-17 21:25」——日期是比'用时间窗反推'可靠得多的证据。",
+  "risk": "极低（纯新增函数；读不到/异常一律返回 False，行为退化为改动前）",
+  "op": "insert_before_function",
+  "function": "click_sign_button",
+  "idempotent_marker": "def _detail_record_is_today(",
+  "expected_delta_lines": 60,
+  "signatures": [
+    "def _detail_record_is_today(",
+    "补丁 D1"
+  ],
+  "new": "# ===== 补丁 D1（2026-09-17）：读页面日期判断记录是不是今天的 =====\ndef _detail_record_is_today(hwnd, full=None):\n    \"\"\"读详情页的「签到时间」，判断这条记录是不是**今天**的。\n\n    【为什么需要·2026-09-17 实测】\n    原来那个守卫的前提是「不在签到时段内的灰色'已签到'记录必然不是今天的」。\n    **这个前提不成立** —— 实测 2026-09-17 21:57：\n    用户在 21:25 自己手动签了（重复签到场景），脚本 21:57 才跑，\n    页面上明明就是**今天**的「已签到」，却被判成 not_time。\n    后果：台账把「今天已签到」记成 not_time —— 统计失真、用户以为没签上。\n\n    **更直接的证据就在页面上**：详情页显示\n        「签到时间：2026-09-17 21:25」\n    —— 日期比「用时间窗反推」可靠得多（README 早已记下这条）。\n\n    【判据】OCR 整窗 -> 找「签到时间」之后的 8 位数字（YYYYMMDD）-> 与今天比较。\n    **读不到 / 引擎不可用 / 异常 -> 返回 False**（铁律 R7），行为退化为改动前。\n    \"\"\"\n    try:\n        if full is None or hwnd is None:\n            return False\n        # ★ 必须只 OCR 小程序窗口那一块，不能整屏 OCR。\n        # 2026-09-18 用真实样本离线验证发现：整屏 OCR 会把任务栏 / 资源管理器\n        # 的文字一起读进来，导致「签到时间」那一行被读错\n        # （实测同一张样本读成 520260972125，多出一位 5，日期就取错了）。\n        # 裁出窗口后同一张样本读作 202609172125 ✅\n        _wl, _wt, _wr, _wb = win_rect(hwnd)\n        if _wl <= -30000 or _wt <= -30000:\n            return False\n        _HH, _WW = full.shape[:2]\n        _wl, _wt = max(0, _wl), max(0, _wt)\n        _wr, _wb = min(_WW, _wr), min(_HH, _wb)\n        if _wr - _wl < 100 or _wb - _wt < 100:\n            return False\n        _win = full[_wt:_wb, _wl:_wr]\n        _eng = _ocr_get_engine()\n        if _eng is None:\n            return False\n        _txt = (_ocr_read(_eng, _win) or \"\").replace(\" \", \"\")\n        if \"签到时间\" not in _txt:\n            return False\n        _seg = _txt.split(\"签到时间\", 1)[1]\n        _digits = \"\".join(ch for ch in _seg if ch.isdigit())\n        if len(_digits) < 8:\n            return False\n        _ymd = _digits[:8]\n        _today = datetime.now().strftime(\"%Y%m%d\")\n        if _ymd == _today:\n            logger.info(f\"[详情页] 页面「签到时间」读到 {_ymd} == 今天 -> 这条记录就是今天的\")\n            return True\n        logger.info(f\"[详情页] 页面「签到时间」读到 {_ymd} != 今天({_today}) -> 不是今天的记录\")\n        return False\n    except Exception as _e:\n        logger.warning(f\"[详情页] 读取页面日期失败（按'不是今天'处理，照旧走原逻辑）: \"\n                       f\"{type(_e).__name__}: {_e}\")\n        return False\n",
+  "id": "D1"
+}

@@ -1,0 +1,15 @@
+{
+  "title": "注入 _win_is_zombie() 僵尸窗口识别函数（Z2 依赖）",
+  "why": "微信退出/崩溃后窗口对象会残留：可枚举、GetWindowRect 有效，但 IsWindowVisible 恒 0 且任何激活手段都无效（进程已死）。本项目 2026-09-16 首次查清、2026-09-17 再次复现。",
+  "risk": "极低（纯新增函数，不被调用时完全无影响）",
+  "op": "insert_before_function",
+  "function": "find_wins",
+  "idempotent_marker": "def _win_is_zombie(",
+  "expected_delta_lines": 54,
+  "signatures": [
+    "def _win_is_zombie(",
+    "补丁 Z1"
+  ],
+  "new": "# ===== 补丁 Z1（2026-09-17）：僵尸窗口识别 =====\ndef _win_is_zombie(hwnd):\n    \"\"\"判断窗口是否为「僵尸」—— 拥有它的进程已退出，只剩窗口对象残留。\n\n    【为什么需要·2026-09-17 真实事故】\n    微信退出后其顶层窗口对象会在系统里残留：可以枚举、GetWindowRect 仍返回\n    有效坐标（看起来很正常），但 IsWindowVisible 恒为 0，且**任何激活手段都无效**\n    —— 因为进程已死，没有任何人处理窗口消息。\n\n    实测因果链（09-17 21:22 那两次失败）：\n      find_wins 找到僵尸窗口（它 rect=1118x1715、面积大，按面积排序排第一）\n        -> activate 选中它 -> ShowWindow/SetForegroundWindow 全无效\n        -> 真正的可用窗口（登录页 586x773）从未被激活 -> 点击落空\n        -> 搜索框匹配失败 -> 重启微信 -> 僵尸仍在枚举列表里 -> 死循环\n        -> 用户看到「任务栏反复弹窗」\n\n    【判据】OpenProcess + GetExitCodeProcess != STILL_ACTIVE。\n\n    【★ 取不到信息时一律按「活着」处理（返回 False）】\n    这是本项目铁律「读不到 != 坏的」：宁可留下一个可疑窗口，\n    也绝不因为权限/异常把正常窗口误判成僵尸而丢掉它。\n    \"\"\"\n    try:\n        pid = ctypes.c_ulong()\n        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))\n        if not pid.value:\n            return False\n        # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000\n        _h = kernel32.OpenProcess(0x1000, False, pid.value)\n        if not _h:\n            # ★★ 2026-09-18 修正·实测发现的真 bug\n            # 死进程的 pid 调 OpenProcess 会**失败**，错误码 = 87\n            # (ERROR_INVALID_PARAMETER = 该 pid 不存在)。\n            # 而僵尸窗口的定义**恰恰就是“拥有它的进程已经死了”**。\n            # 原来这里一律 return False（按活着处理），后果是\n            # **僵尸永远判不出来** —— 整个 Z 补丁等于失效。\n            # 现在按错误码区分：\n            _err = kernel32.GetLastError()\n            if _err == 87:      # 该 pid 不存在 -> 进程已退出 -> 僵尸\n                return True\n            return False        # 其它（如 5=权限不足）-> 不敢断言 -> 按活着处理\n        try:\n            _code = ctypes.c_ulong()\n            if not kernel32.GetExitCodeProcess(_h, ctypes.byref(_code)):\n                return False\n            return _code.value != 259    # 259 = STILL_ACTIVE\n        finally:\n            kernel32.CloseHandle(_h)\n    except Exception:\n        return False\n",
+  "id": "Z1"
+}

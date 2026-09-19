@@ -1,0 +1,15 @@
+{
+  "title": "注入 _is_not_in_area() 识别「不在区域内」（N2 依赖）",
+  "why": "地图页定位漂移时底部按钮是灰色「不在区域内」，与「已结束」同为灰宽按钮，阶段A 无法区分，于是把'定位漂移'误报成'今天没推送'。",
+  "risk": "极低（纯新增函数；读不到/异常一律返回 False，行为完全退化为改动前）",
+  "op": "insert_before_function",
+  "function": "click_sign_button",
+  "idempotent_marker": "def _is_not_in_area(",
+  "expected_delta_lines": 43,
+  "signatures": [
+    "def _is_not_in_area(",
+    "补丁 N1"
+  ],
+  "new": "# ===== 补丁 N1（2026-09-17）：识别「不在区域内」 =====\ndef _is_not_in_area(hwnd, btns, full=None):\n    \"\"\"判断底部那个灰色宽按钮是不是「不在区域内」（= 地图页 + 定位漂移）。\n\n    【为什么需要·用户 2026-09-17 明确要求】\n    地图页在「定位漂到校外」时，底部按钮由绿变灰、文字变成「不在区域内」。\n    而 click_sign_button() 阶段A 的判据只看有没有蓝/绿/灰按钮 ——\n    一个灰色宽按钮会被当成「未到签到时段/已结束」，**直接判 not_time 并 return**。\n\n    后果有两层（都很严重）：\n      ① 明明只是定位漂移，却报成「今天没推送」——**误报正常状态**（违反铁律 R14）。\n         用户看台账会以为今天没推送；自愈不记故障；飞书也报「并非失败」。\n      ② 外层重试循环看到 not_time 就 break（日志原话「重试无意义」），\n         **连\"重新跑一遍流程\"的机会都没有**。\n         用户原话：「如果遇到不在区域内重新跑一遍流程，然后去签到」。\n\n    【判据】OCR 读该灰按钮文字，命中「不在区域内/未在区域/不在区域」即认定。\n    **读不到 / 引擎不可用 / 任何异常 -> 一律返回 False**（铁律 R7：读不到 != 坏的），\n    这样行为**完全退化为改动前**，绝不引入新的误判。\n    \"\"\"\n    try:\n        if full is None or not btns:\n            return False\n        _grays = [b for b in btns if b.get(\"kind\") == \"gray\"]\n        if not _grays:\n            return False\n        _b = max(_grays, key=lambda z: z.get(\"w\", 0) * z.get(\"h\", 0))\n        _t = (ocr_button_text(full, _b) or \"\").replace(\" \", \"\")\n        if not _t:\n            return False\n        for _kw in (\"不在区域内\", \"未在区域\", \"不在区域\"):\n            if _kw in _t:\n                logger.warning(f\"[详情页] 灰按钮文字读到「{_t[:20]}」-> 判定为地图页定位漂移\")\n                return True\n        return False\n    except Exception as _e:\n        logger.warning(f\"[详情页] 判断「不在区域内」失败（按'不是'处理，照旧走原逻辑）: \"\n                       f\"{type(_e).__name__}: {_e}\")\n        return False\n",
+  "id": "N1"
+}

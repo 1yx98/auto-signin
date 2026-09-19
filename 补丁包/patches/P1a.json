@@ -1,0 +1,15 @@
+{
+  "id": "P1a",
+  "title": "注入 _scroll_fingerprint() 辅助函数（P1b 依赖）",
+  "why": "P1b 需要判断'页面滚动了没有'。此函数用低分辨率灰度缩略图做指纹，成本约 3ms，不参与成功判定。",
+  "risk": "极低。纯新增函数，不修改任何现有代码路径；不装 P1b 时它不会被调用。",
+  "op": "insert_before_function",
+  "function": "open_signin_entry",
+  "idempotent_marker": "def _scroll_fingerprint(",
+  "expected_delta_lines": 30,
+  "signatures": [
+    "def _scroll_fingerprint(",
+    "补丁 P1a"
+  ],
+  "new": "# ===== 补丁 P1a（2026-09-16）：滚动指纹 =====\n# 【为什么需要】原滚动循环无法回答\"页面到底动了没有\"，导致：\n#   · 页面没滚动时 6 次匹配拿到完全相同的分数，却白白耗时 6×0.9s；\n#   · 更危险的是它把\"根本没滚动\"伪装成\"滚了6次都没找到\"，掩盖了真因。\n# 本函数只回答一个问题：**画面变了没有**。故意做得极简（缩略图均值哈希）：\n#   · 不引入新依赖（复用已有的 cv2 / numpy / ImageGrab）\n#   · 不做任何成功/失败判定 —— 它只是补丁流程里的\"传感器\"，\n#     所以即使它失效（返回 None），调用方也只是退回到\"照旧多滚几次\"，\n#     **绝不会因此误判签到结果**。这条边界很重要：传感器坏了不能变成判决错了。\ndef _scroll_fingerprint(hwnd):\n    \"\"\"取窗口画面的低分辨率灰度指纹，用于判断\"滚动前后页面是否变化\"。\n\n    返回 64 字节的 bytes（16x16 灰度）；取不到时返回 None。\n    调用方必须处理 None（表示\"测不了\"），且**不得**据此做出任何成功/失败结论。\n    \"\"\"\n    if not hwnd:\n        return None\n    try:\n        l, t, r, b = win_rect(hwnd)\n        if r - l < 50 or b - t < 50:\n            return None\n        img = ImageGrab.grab(bbox=(int(l), int(t), int(r), int(b)))\n        g = np.array(img.convert(\"L\").resize((16, 16)), dtype=np.uint8)\n        return g.tobytes()\n    except Exception as e:\n        logger.warning(f\"[导航] 滚动指纹获取失败（不影响流程）: {type(e).__name__}: {e}\")\n        return None"
+}

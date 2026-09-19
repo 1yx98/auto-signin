@@ -1,0 +1,20 @@
+{
+  "id": "P1b",
+  "title": "滚动循环等待页面真正变化（消除偶发失败）",
+  "why": "下滚6次 conf 长期恒为 0.666（今日日志出现 61 次），说明脚本不关心页面动没动。同一输入多次跑结果不一致 = 偶发失败温床。",
+  "risk": "低。仅在滚动未生效时多滚几次；命中逻辑与阈值（CONFIDENCE）完全不变。依赖 P1a。",
+  "depends_on": [
+    "P1a"
+  ],
+  "op": "replace_loop",
+  "function": "open_signin_entry",
+  "loop_index": 0,
+  "loop_signature": "下滚第{k+1}次",
+  "expected_delta_lines": 28,
+  "signatures": [
+    "页面未变化，继续滚动",
+    "连续补滚后页面仍未变化",
+    "下滚第{k+1}次"
+  ],
+  "new": "        for k in range(6):\n            h = activate(MINIAPP_TITLE, exact=True); time.sleep(0.2)\n            if h:\n                l, t, r, b = win_rect(h)\n                pyautogui.moveTo((l + r) // 2, (t + b) // 2)\n\n            # 【补丁P1b·2026-09-16】滚动后必须确认\"页面真的动了\"再匹配。\n            # 原实现 scroll -> sleep(0.9) -> match，有三个问题：\n            #   ① 小程序异步渲染，0.9s 常只够滚动动画播一半，此时截到的是中间帧；\n            #   ② 页面**根本没滚动**时（已到底/焦点不在滚动区），6 次匹配会拿到\n            #      **完全相同的分数**（今日日志 conf=0.666 出现 61 次），\n            #      却如实报告\"下滚第6次 conf=0.666\"——看起来在工作，实际 6×0.9s 全白费，\n            #      还掩盖了\"根本没滚动\"这个事实；\n            #   ③ 同一输入多次跑结果不一致正是\"偶发失败\"的温床（本项目第3条教训）。\n            # 修法：滚一次就查\"指纹变了没有\"；没变则补滚，最多 3 次。\n            #       指纹只判断\"动没动\"，**不参与成功判定**，不会引入新误判。\n            _before = _scroll_fingerprint(h)\n            pyautogui.scroll(-180)\n            time.sleep(0.9)\n            _moved = False\n            for _retry in range(3):\n                _after = _scroll_fingerprint(h)\n                if _before is not None and _after is not None and _after != _before:\n                    _moved = True\n                    break\n                logger.info(f\"[导航] 第{i+1}步「{name}」下滚第{k+1}次 页面未变化，继续滚动({_retry+1}/3)\")\n                pyautogui.scroll(-180)\n                time.sleep(0.6)\n            if not _moved and _before is not None:\n                logger.warning(f\"[导航] 第{i+1}步「{name}」下滚第{k+1}次 连续补滚后页面仍未变化\"\n                               f\"（可能已到底或页面不可滚动）\")\n            # 让渲染稳定下来再匹配，避免拿中间帧去比模板\n            time.sleep(0.4)\n\n            if topmost:\n                c, x, y = match_topmost(tpl, scales=NAV_SCALES)\n            else:\n                c, x, y = match(tpl, scales=NAV_SCALES)\n            _tail = \"（页面已滚动）\" if _moved else \"（页面未滚动/无法判断）\"\n            logger.info(f\"[导航] 第{i+1}步「{name}」下滚第{k+1}次 conf={c:.3f}{_tail}\")\n            shot(f\"找_{name}_{k}\")\n            if c >= CONFIDENCE:\n                if topmost:\n                    # 同首屏分支：颜色判定仅作参考日志，不再短路判成功（见上方 2026-09-15 架构调整说明）\n                    h = activate(MINIAPP_TITLE, exact=True)\n                    gok, gdesc = first_card_status_green(h, x, y)\n                    logger.info(f\"[导航] 第{i+1}步「{name}」下滚后列表状态参考：{gdesc}\"\n                                f\"（仅供参考，不据此判成功，一律进详情页核实）\")\n                pyautogui.click(x, y)\n                logger.info(f\"[导航] 第{i+1}步「{name}」命中并点击({x},{y})\")\n                time.sleep(3); found = True\n                break"
+}

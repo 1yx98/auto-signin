@@ -1,0 +1,16 @@
+{
+  "title": "find_wins() 过滤僵尸窗口（不再选中已死进程的残留窗口）",
+  "why": "僵尸窗口 rect 大，在 activate 的按面积排序里总是排第一，于是每次都被选中、每次激活都失败。必须在**进入候选列表之前**就排除掉。",
+  "risk": "低（只新增一个过滤分支；_win_is_zombie 取不到信息时按活着处理，不会误杀）",
+  "op": "replace_lines",
+  "function": "find_wins",
+  "find": "out.append((h, t))",
+  "expected_delta_lines": 5,
+  "signatures": [
+    "_win_is_zombie(h)",
+    "跳过僵尸窗口",
+    "补丁 Z2"
+  ],
+  "new": "            # 【补丁 Z2·2026-09-17】进入候选列表前排除僵尸窗口。\n            if _win_is_zombie(h):\n                logger.warning(f\"[窗口] 跳过僵尸窗口 hwnd={h} {t!r}\"\n                               f\"（拥有它的进程已退出，窗口对象残留，激活必然失败）\")\n                continue\n            out.append((h, t))",
+  "id": "Z2"
+}

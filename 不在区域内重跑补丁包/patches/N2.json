@@ -1,0 +1,18 @@
+{
+  "title": "阶段A 区分「定位漂移」与「未到时段」：前者不判 not_time，转入定位自愈",
+  "why": "两者都是灰色宽按钮但含义完全不同 —— 定位漂移应该重试/自愈，只有真的未到时段/已结束才该收工。原代码一律判 not_time，既掩盖了故障、又跳过了本该跑的定位自愈（重新定位/重连 WiFi）。",
+  "risk": "低（只有 OCR 明确读到「不在区域内」才改变走向；其余情况逐字等价于原逻辑）",
+  "op": "replace_lines",
+  "function": "click_sign_button",
+  "find": "if not green and gray:",
+  "expected_delta_lines": 9,
+  "signatures": [
+    "补丁 N2",
+    "转入定位自愈"
+  ],
+  "absent_signatures": [
+    "if not green and gray:\n"
+  ],
+  "new": "        # 【补丁 N2·2026-09-17】先分辨「地图页定位漂移」与「未到时段/已结束」——\n        # 两者都是灰色宽按钮，含义却完全不同：前者应重试/自愈，后者才该收工。\n        # 这里**只加条件、不动原函数体**，避免\"旧代码残留在后面\"（见 absent_signatures）。\n        _not_in_area = (not green and bool(gray)\n                        and _is_not_in_area(h, btns, full=(_cap_last[0] if _cap_last else None)))\n        if _not_in_area:\n            logger.warning(\"[详情页] 检测到灰色「不在区域内」—— 已在地图页但定位漂移，\"\n                           \"**不判 not_time**；转入定位自愈（重新定位 / 重连 WiFi），\"\n                           \"仍不行会返回失败并由外层完整重跑一遍流程\")\n        if not green and gray and not _not_in_area:",
+  "id": "N2"
+}

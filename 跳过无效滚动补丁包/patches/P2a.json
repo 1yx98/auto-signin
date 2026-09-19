@@ -1,0 +1,15 @@
+{
+  "id": "P2a",
+  "title": "注入 _already_signed_detail() 已签到态预检函数（P2b 依赖）",
+  "why": "P2b 需要「滚动前先探一下页面是不是已签到态」。复用主程序已有的 scan_buttons + signed_detail_button，判据完全一致；返回 False 表示「探不到」，调用方一律按原行为处理。",
+  "risk": "极低。纯新增函数，不修改任何现有代码路径；不装 P2b 时不会被调用。",
+  "op": "insert_before_function",
+  "function": "open_signin_entry",
+  "idempotent_marker": "def _already_signed_detail(",
+  "expected_delta_lines": 41,
+  "signatures": [
+    "def _already_signed_detail(",
+    "补丁 P2a"
+  ],
+  "new": "# ===== 补丁 P2a（2026-09-16）：已签到态预检 =====\n# 【为什么需要】2026-09-16 20:55 实测发现一条真实路径：\n#   用户已签到时，第 4 步要找的\"蓝色签到按钮\"（24_signin_enter.png）\n#   **根本不在页面上**（已签到态只有灰色「已签到」）。脚本因此白滚 6 轮\n#   （conf 恒为 0.593、6 张截图逐字节完全相同），白耗约 42 秒，\n#   最后才走兜底分支成功。**结论本来就对，只是绕了远路。**\n#\n# 本函数只回答一个问题：**当前页面是不是\"已签到/已结束\"状态**。\n# 复用主程序已有的 `scan_buttons` + `signed_detail_button`（判据完全一致），\n# **不做任何成功/失败判定** —— 它只是\"提前探路\"的传感器：\n#   · 返回 True  → 调用方跳过滚动，直接进兜底（省约 40 秒）\n#   · 返回 False → 一切照旧，滚 6 次（**与原行为逐字一致**）\n#   · 抛异常     → 吞掉并返回 False（退化为原行为，绝不打断流程）\ndef _already_signed_detail(hwnd):\n    \"\"\"探测当前窗口是否已处于\"已签到/已结束\"详情页。\n\n    返回 True/False。任何异常都吞掉返回 False（表示\"探不到\"），\n    **调用方必须把它当\"没探到\"处理，不得据此做任何成功/失败结论。**\n    \"\"\"\n    try:\n        if not hwnd:\n            return False\n        _cap = []\n        _btns = scan_buttons(hwnd, grab_full=_cap)\n        _out = {}\n        _hit = signed_detail_button(hwnd, _btns,\n                                    full=(_cap[0] if _cap else None), out=_out)\n        if _hit:\n            return True\n        # OCR 明确读到\"已结束/未开始\"等否定词 → 这页也没有\"进入按钮\"可点，\n        # 同样不值得滚动（滚动找的就是那个蓝色按钮，这里已经没有它了）。\n        if _out.get(\"negative\"):\n            return True\n        return False\n    except Exception as e:\n        logger.warning(f\"[导航] 已签到态预检失败（不影响流程，将照旧滚动）: \"\n                       f\"{type(e).__name__}: {e}\")\n        return False"
+}

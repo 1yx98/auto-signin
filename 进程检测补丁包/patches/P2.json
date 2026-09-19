@@ -1,0 +1,15 @@
+{
+  "title": "wechat_running() 区分「没运行」与「没查成」，避免误启动多余实例",
+  "why": "查不到进程时不该直接启动微信：如果微信其实在运行，多启动一个实例会制造任务栏弹窗噪音（用户 09-16 / 09-17 两次报的「任务栏问题」）。改为：查成且确实没有 -> 启动；没查成 -> 用「窗口是否存在」交叉验证，仍不能确定就**不启动**、如实告警。",
+  "risk": "低（只在「检测失败」这条原本就有缺陷的分支上改变行为）",
+  "op": "replace_lines",
+  "function": "wechat_running",
+  "find": "return \"Weixin.exe\" in (r.stdout or \"\")",
+  "expected_delta_lines": 13,
+  "signatures": [
+    "补丁 P2",
+    "不启动新实例"
+  ],
+  "new": "        # 【补丁 P2·2026-09-17】三态处理：查到有 / 查到没有 / 根本没查成\n        _found, _ok = _tasklist_has(\"Weixin.exe\")\n        if _ok:\n            return _found\n        # 没查成 -> 用「窗口是否存在」交叉验证。注意：僵尸窗口也算「有窗口」，\n        # 但这里只关心「要不要启动微信」，保守不启动更安全。\n        _has_win = bool(find_wins(\"微信\")) or bool(find_wins(\"Weixin\"))\n        if _has_win:\n            logger.warning(\"[进程] tasklist 查不到微信，但存在微信窗口 —— \"\n                           \"不启动新实例（避免制造多余弹窗）\")\n            return True\n        logger.warning(\"[进程] 无法确定微信是否在运行，且未见微信窗口 —— \"\n                       \"按未运行处理，交由 start_wechat 兜底\")\n        return False",
+  "id": "P2"
+}

@@ -1,0 +1,15 @@
+{
+  "title": "注入 _tasklist_has() 进程探测辅助函数（P2 依赖）",
+  "why": "原 wechat_running() 用一次 tasklist 的结果直接当结论，且把「检测失败」与「真的没运行」压成同一个 False。",
+  "risk": "极低（纯新增函数）",
+  "op": "insert_before_function",
+  "function": "wechat_running",
+  "idempotent_marker": "def _tasklist_has(",
+  "expected_delta_lines": 23,
+  "signatures": [
+    "def _tasklist_has(",
+    "补丁 P1"
+  ],
+  "new": "# ===== 补丁 P1（2026-09-17）：进程探测辅助 =====\ndef _tasklist_has(imagename, timeout=15):\n    \"\"\"查 tasklist 里是否有该进程。返回 (是否在, 是否成功查到)。\n\n    【为什么要把「查到没在」和「没查成」分开】原 wechat_running() 只有\n    一个 bool 返回值，于是「tasklist 超时/编码异常」和「微信真的没运行」\n    被压成同一个 False。两者后果完全不同：\n      · 真的没运行   -> 应该启动微信\n      · 没查成       -> **不该**贸然启动（微信可能正在运行，启动多余实例\n                        会制造任务栏弹窗噪音，正是用户报的「任务栏问题」）\n    \"\"\"\n    try:\n        r = subprocess.run([\"tasklist\", \"/FI\", f\"IMAGENAME eq {imagename}\"],\n                           capture_output=True, text=True, encoding=\"gbk\",\n                           errors=\"ignore\", timeout=timeout)\n        return (imagename in (r.stdout or \"\")), True\n    except Exception as _e:\n        logger.warning(f\"[进程] 查询 {imagename} 失败（不代表它没运行）: {_e}\")\n        return False, False\n",
+  "id": "P1"
+}

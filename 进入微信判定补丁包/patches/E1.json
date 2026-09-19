@@ -1,0 +1,15 @@
+{
+  "title": "「进入微信」匹配失败时不再谎报「已在主界面」",
+  "why": "match() 在「命中点越界/完全匹配不到」时返回 conf=-1.0。原代码把 conf<0.8 一律当成「没有确认页 -> 已在主界面」，于是窗口明明不可见、页面停在登录页，脚本却带着错误认知一路往下走，直到搜索框连续失败才暴露（而且报的是「窗口状态坏了」）。",
+  "risk": "低（只改一行日志与其前的判定；不改变点击/流程走向）",
+  "op": "replace_lines",
+  "function": "step_enter_wechat",
+  "find": "logger.info(\"[进入微信] 已在主界面，无需确认\")",
+  "expected_delta_lines": 11,
+  "signatures": [
+    "补丁 E1",
+    "不能据此断定"
+  ],
+  "new": "        # 【补丁 E1·2026-09-17】conf < 0 是「匹配不到/命中点越界」，\n        # **不等于**「页面上没有确认页按钮」。原来直接把两者当同一件事，\n        # 会谎报「已在主界面」，掩盖真实现场（09-17 21:22 实测：\n        # 报「已在主界面」时页面其实停在登录页，且窗口 IsWindowVisible=0）。\n        if c < 0:\n            _vw = activate(\"微信\", exact=True)\n            _vis = bool(_vw) and user32.IsWindowVisible(_vw)\n            logger.warning(f\"[进入微信] 确认页按钮匹配失败(conf={c:.3f}) —— \"\n                           f\"不能据此断定「已在主界面」；当前微信窗口可见={_vis}\"\n                           + (\"（窗口不可见，后续匹配很可能失败）\" if not _vis else \"\"))\n        else:\n            logger.info(\"[进入微信] 已在主界面，无需确认\")",
+  "id": "E1"
+}

@@ -1,0 +1,18 @@
+{
+  "title": "时段外的「已签到」先用页面日期核实：是今天就判成功，不再误报 not_time",
+  "why": "原守卫只用时间窗反推，遇到「用户自己在时段内手动签、脚本在时段外才跑」就会把今天的成功记录误报成 not_time。改成先读页面日期。",
+  "risk": "低（读不到日期时 `_rec_today=False`，该行逐字等价于原条件）",
+  "op": "replace_lines",
+  "function": "click_sign_button",
+  "find": "if finish_clicks == 0 and not _within_signin_window():",
+  "expected_delta_lines": 4,
+  "signatures": [
+    "补丁 D2",
+    "_rec_today"
+  ],
+  "absent_signatures": [
+    "if finish_clicks == 0 and not _within_signin_window():\n"
+  ],
+  "new": "            # 【补丁 D2·2026-09-17】用页面上的日期做**更直接的判据**：\n            # 若「签到时间」就是今天，说明这条记录是今天的 -> 直接判成功，\n            # 不再因为\"超出脚本时段\"而误报 not_time。\n            _rec_today = _detail_record_is_today(h, (_cap_last[0] if _cap_last else None))\n            if finish_clicks == 0 and not _within_signin_window() and not _rec_today:",
+  "id": "D2"
+}

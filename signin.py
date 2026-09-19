@@ -834,10 +834,69 @@ def enum_windows(include_hidden=True):
     user32.EnumWindows(EnumWindowsProc(cb), 0)
     return res
 
+# ===== 补丁 Z1（2026-09-17）：僵尸窗口识别 =====
+def _win_is_zombie(hwnd):
+    """判断窗口是否为「僵尸」—— 拥有它的进程已退出，只剩窗口对象残留。
+
+    【为什么需要·2026-09-17 真实事故】
+    微信退出后其顶层窗口对象会在系统里残留：可以枚举、GetWindowRect 仍返回
+    有效坐标（看起来很正常），但 IsWindowVisible 恒为 0，且**任何激活手段都无效**
+    —— 因为进程已死，没有任何人处理窗口消息。
+
+    实测因果链（09-17 21:22 那两次失败）：
+      find_wins 找到僵尸窗口（它 rect=1118x1715、面积大，按面积排序排第一）
+        -> activate 选中它 -> ShowWindow/SetForegroundWindow 全无效
+        -> 真正的可用窗口（登录页 586x773）从未被激活 -> 点击落空
+        -> 搜索框匹配失败 -> 重启微信 -> 僵尸仍在枚举列表里 -> 死循环
+        -> 用户看到「任务栏反复弹窗」
+
+    【判据】OpenProcess + GetExitCodeProcess != STILL_ACTIVE。
+
+    【★ 取不到信息时一律按「活着」处理（返回 False）】
+    这是本项目铁律「读不到 != 坏的」：宁可留下一个可疑窗口，
+    也绝不因为权限/异常把正常窗口误判成僵尸而丢掉它。
+    """
+    try:
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return False
+        # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        _h = kernel32.OpenProcess(0x1000, False, pid.value)
+        if not _h:
+            # ★★ 2026-09-18 修正·实测发现的真 bug
+            # 死进程的 pid 调 OpenProcess 会**失败**，错误码 = 87
+            # (ERROR_INVALID_PARAMETER = 该 pid 不存在)。
+            # 而僵尸窗口的定义**恰恰就是“拥有它的进程已经死了”**。
+            # 原来这里一律 return False（按活着处理），后果是
+            # **僵尸永远判不出来** —— 整个 Z 补丁等于失效。
+            # 现在按错误码区分：
+            _err = kernel32.GetLastError()
+            if _err == 87:      # 该 pid 不存在 -> 进程已退出 -> 僵尸
+                return True
+            return False        # 其它（如 5=权限不足）-> 不敢断言 -> 按活着处理
+        try:
+            _code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(_h, ctypes.byref(_code)):
+                return False
+            return _code.value != 259    # 259 = STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(_h)
+    except Exception:
+        return False
+
+
+
+
 def find_wins(keyword, exact=False):
     out = []
     for h, t in enum_windows(True):
         if (t == keyword) if exact else (keyword in t):
+            # 【补丁 Z2·2026-09-17】进入候选列表前排除僵尸窗口。
+            if _win_is_zombie(h):
+                logger.warning(f"[窗口] 跳过僵尸窗口 hwnd={h} {t!r}"
+                               f"（拥有它的进程已退出，窗口对象残留，激活必然失败）")
+                continue
             out.append((h, t))
     return out
 
@@ -952,13 +1011,49 @@ def activate(keyword, exact=False, prefer_largest=True, logs=True):
     return hwnd
 
 # ==================== 进程 ====================
+
+# ===== 补丁 P1（2026-09-17）：进程探测辅助 =====
+def _tasklist_has(imagename, timeout=15):
+    """查 tasklist 里是否有该进程。返回 (是否在, 是否成功查到)。
+
+    【为什么要把「查到没在」和「没查成」分开】原 wechat_running() 只有
+    一个 bool 返回值，于是「tasklist 超时/编码异常」和「微信真的没运行」
+    被压成同一个 False。两者后果完全不同：
+      · 真的没运行   -> 应该启动微信
+      · 没查成       -> **不该**贸然启动（微信可能正在运行，启动多余实例
+                        会制造任务栏弹窗噪音，正是用户报的「任务栏问题」）
+    """
+    try:
+        r = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {imagename}"],
+                           capture_output=True, text=True, encoding="gbk",
+                           errors="ignore", timeout=timeout)
+        return (imagename in (r.stdout or "")), True
+    except Exception as _e:
+        logger.warning(f"[进程] 查询 {imagename} 失败（不代表它没运行）: {_e}")
+        return False, False
+
+
+
 def wechat_running():
     """检测微信是否在运行。必须给 timeout：tasklist 偶发卡住会让整个脚本一直挂着，
     直到定时任务 30 分钟上限被强杀。异常一律按"未运行"处理，交给 start_wechat 兜底。"""
     try:
         r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Weixin.exe"],
                            capture_output=True, text=True, encoding="gbk", errors="ignore", timeout=15)
-        return "Weixin.exe" in (r.stdout or "")
+        # 【补丁 P2·2026-09-17】三态处理：查到有 / 查到没有 / 根本没查成
+        _found, _ok = _tasklist_has("Weixin.exe")
+        if _ok:
+            return _found
+        # 没查成 -> 用「窗口是否存在」交叉验证。注意：僵尸窗口也算「有窗口」，
+        # 但这里只关心「要不要启动微信」，保守不启动更安全。
+        _has_win = bool(find_wins("微信")) or bool(find_wins("Weixin"))
+        if _has_win:
+            logger.warning("[进程] tasklist 查不到微信，但存在微信窗口 —— "
+                           "不启动新实例（避免制造多余弹窗）")
+            return True
+        logger.warning("[进程] 无法确定微信是否在运行，且未见微信窗口 —— "
+                       "按未运行处理，交由 start_wechat 兜底")
+        return False
     except Exception as _e:
         logger.warning("[进程] 检测微信进程失败(按未运行处理，将由 start_wechat 兜底): %s" % _e)
         return False
@@ -1597,7 +1692,18 @@ def step_enter_wechat(allow_restart=True):
             return restart_wechat_and_enter()
         shot("进入微信后")
     else:
-        logger.info("[进入微信] 已在主界面，无需确认")
+        # 【补丁 E1·2026-09-17】conf < 0 是「匹配不到/命中点越界」，
+        # **不等于**「页面上没有确认页按钮」。原来直接把两者当同一件事，
+        # 会谎报「已在主界面」，掩盖真实现场（09-17 21:22 实测：
+        # 报「已在主界面」时页面其实停在登录页，且窗口 IsWindowVisible=0）。
+        if c < 0:
+            _vw = activate("微信", exact=True)
+            _vis = bool(_vw) and user32.IsWindowVisible(_vw)
+            logger.warning(f"[进入微信] 确认页按钮匹配失败(conf={c:.3f}) —— "
+                           f"不能据此断定「已在主界面」；当前微信窗口可见={_vis}"
+                           + ("（窗口不可见，后续匹配很可能失败）" if not _vis else ""))
+        else:
+            logger.info("[进入微信] 已在主界面，无需确认")
         h = wait_wechat_rendered(timeout=8, tag="主界面")
         if not h and allow_restart:
             return restart_wechat_and_enter()
@@ -2149,6 +2255,77 @@ def first_card_status_green(hwnd, title_cx, title_cy):
         logger.warning(f"[列表已签] 检测异常（按未签处理，不影响主流程）: {e}")
         return False, f"异常:{e}"
 
+# ===== 补丁 P1a（2026-09-16）：滚动指纹 =====
+# 【为什么需要】原滚动循环无法回答"页面到底动了没有"，导致：
+#   · 页面没滚动时 6 次匹配拿到完全相同的分数，却白白耗时 6×0.9s；
+#   · 更危险的是它把"根本没滚动"伪装成"滚了6次都没找到"，掩盖了真因。
+# 本函数只回答一个问题：**画面变了没有**。故意做得极简（缩略图均值哈希）：
+#   · 不引入新依赖（复用已有的 cv2 / numpy / ImageGrab）
+#   · 不做任何成功/失败判定 —— 它只是补丁流程里的"传感器"，
+#     所以即使它失效（返回 None），调用方也只是退回到"照旧多滚几次"，
+#     **绝不会因此误判签到结果**。这条边界很重要：传感器坏了不能变成判决错了。
+def _scroll_fingerprint(hwnd):
+    """取窗口画面的低分辨率灰度指纹，用于判断"滚动前后页面是否变化"。
+
+    返回 64 字节的 bytes（16x16 灰度）；取不到时返回 None。
+    调用方必须处理 None（表示"测不了"），且**不得**据此做出任何成功/失败结论。
+    """
+    if not hwnd:
+        return None
+    try:
+        l, t, r, b = win_rect(hwnd)
+        if r - l < 50 or b - t < 50:
+            return None
+        img = ImageGrab.grab(bbox=(int(l), int(t), int(r), int(b)))
+        g = np.array(img.convert("L").resize((16, 16)), dtype=np.uint8)
+        return g.tobytes()
+    except Exception as e:
+        logger.warning(f"[导航] 滚动指纹获取失败（不影响流程）: {type(e).__name__}: {e}")
+        return None
+
+# ===== 补丁 P2a（2026-09-16）：已签到态预检 =====
+# 【为什么需要】2026-09-16 20:55 实测发现一条真实路径：
+#   用户已签到时，第 4 步要找的"蓝色签到按钮"（24_signin_enter.png）
+#   **根本不在页面上**（已签到态只有灰色「已签到」）。脚本因此白滚 6 轮
+#   （conf 恒为 0.593、6 张截图逐字节完全相同），白耗约 42 秒，
+#   最后才走兜底分支成功。**结论本来就对，只是绕了远路。**
+#
+# 本函数只回答一个问题：**当前页面是不是"已签到/已结束"状态**。
+# 复用主程序已有的 `scan_buttons` + `signed_detail_button`（判据完全一致），
+# **不做任何成功/失败判定** —— 它只是"提前探路"的传感器：
+#   · 返回 True  → 调用方跳过滚动，直接进兜底（省约 40 秒）
+#   · 返回 False → 一切照旧，滚 6 次（**与原行为逐字一致**）
+#   · 抛异常     → 吞掉并返回 False（退化为原行为，绝不打断流程）
+def _already_signed_detail(hwnd):
+    """探测当前窗口是否已处于"已签到/已结束"详情页。
+
+    返回 True/False。任何异常都吞掉返回 False（表示"探不到"），
+    **调用方必须把它当"没探到"处理，不得据此做任何成功/失败结论。**
+    """
+    try:
+        if not hwnd:
+            return False
+        _cap = []
+        _btns = scan_buttons(hwnd, grab_full=_cap)
+        _out = {}
+        _hit = signed_detail_button(hwnd, _btns,
+                                    full=(_cap[0] if _cap else None), out=_out)
+        if _hit:
+            return True
+        # OCR 明确读到"已结束/未开始"等否定词 → 这页也没有"进入按钮"可点，
+        # 同样不值得滚动（滚动找的就是那个蓝色按钮，这里已经没有它了）。
+        if _out.get("negative"):
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"[导航] 已签到态预检失败（不影响流程，将照旧滚动）: "
+                       f"{type(e).__name__}: {e}")
+        return False
+
+
+
+
+
 def open_signin_entry():
     """按 config.signin_nav_steps 顺序，一路点进多级入口（日常管理 -> 签到消息 -> 每日签到）。
     每一级：先首屏找，找不到就小步向下滚动找；找到点击后停留等待该级页面加载。"""
@@ -2212,17 +2389,56 @@ def open_signin_entry():
             return False
         found = False
         for k in range(6):
+            # 【补丁 P2b·2026-09-16】滚动之前先探一次「是否已是已签到态」。
+            # 已签到态下那个蓝色「签到」按钮（本轮要找的模板）根本不在页面上，
+            # 滚 6 次必然全部失败（实测 conf 恒为 0.593、6 张截图逐字节相同），
+            # 白耗约 42 秒。提前探到就让 found 保持 False、直接落进下方兜底分支
+            # ——那条路本来就会正确判定（检测到灰色「已签到」→ 视为已到达）。
+            # 探不到则完全退化为原行为（照旧滚 6 次），故不会引入误判。
+            if k == 0 and _already_signed_detail(activate(MINIAPP_TITLE, exact=True)):
+                logger.info(f"[导航] 第{i+1}步「{name}」滚动前预检：页面已是"
+                            f"'已签到/已结束'态，跳过 6 轮无效滚动（省约 40 秒）")
+                shot(f"nav{i+1}_{name}_预检已签到")
+                break
             h = activate(MINIAPP_TITLE, exact=True); time.sleep(0.2)
             if h:
                 l, t, r, b = win_rect(h)
                 pyautogui.moveTo((l + r) // 2, (t + b) // 2)
+
+            # 【补丁P1b·2026-09-16】滚动后必须确认"页面真的动了"再匹配。
+            # 原实现 scroll -> sleep(0.9) -> match，有三个问题：
+            #   ① 小程序异步渲染，0.9s 常只够滚动动画播一半，此时截到的是中间帧；
+            #   ② 页面**根本没滚动**时（已到底/焦点不在滚动区），6 次匹配会拿到
+            #      **完全相同的分数**（今日日志 conf=0.666 出现 61 次），
+            #      却如实报告"下滚第6次 conf=0.666"——看起来在工作，实际 6×0.9s 全白费，
+            #      还掩盖了"根本没滚动"这个事实；
+            #   ③ 同一输入多次跑结果不一致正是"偶发失败"的温床（本项目第3条教训）。
+            # 修法：滚一次就查"指纹变了没有"；没变则补滚，最多 3 次。
+            #       指纹只判断"动没动"，**不参与成功判定**，不会引入新误判。
+            _before = _scroll_fingerprint(h)
             pyautogui.scroll(-180)
             time.sleep(0.9)
+            _moved = False
+            for _retry in range(3):
+                _after = _scroll_fingerprint(h)
+                if _before is not None and _after is not None and _after != _before:
+                    _moved = True
+                    break
+                logger.info(f"[导航] 第{i+1}步「{name}」下滚第{k+1}次 页面未变化，继续滚动({_retry+1}/3)")
+                pyautogui.scroll(-180)
+                time.sleep(0.6)
+            if not _moved and _before is not None:
+                logger.warning(f"[导航] 第{i+1}步「{name}」下滚第{k+1}次 连续补滚后页面仍未变化"
+                               f"（可能已到底或页面不可滚动）")
+            # 让渲染稳定下来再匹配，避免拿中间帧去比模板
+            time.sleep(0.4)
+
             if topmost:
                 c, x, y = match_topmost(tpl, scales=NAV_SCALES)
             else:
                 c, x, y = match(tpl, scales=NAV_SCALES)
-            logger.info(f"[导航] 第{i+1}步「{name}」下滚第{k+1}次 conf={c:.3f}")
+            _tail = "（页面已滚动）" if _moved else "（页面未滚动/无法判断）"
+            logger.info(f"[导航] 第{i+1}步「{name}」下滚第{k+1}次 conf={c:.3f}{_tail}")
             shot(f"找_{name}_{k}")
             if c >= CONFIDENCE:
                 if topmost:
@@ -2983,6 +3199,109 @@ def reopen_miniprogram_to_refresh():
     logger.info("[刷新] 已重新进入油学通并到达签到详情页")
     return True
 
+# ===== 补丁 N1（2026-09-17）：识别「不在区域内」 =====
+def _is_not_in_area(hwnd, btns, full=None):
+    """判断底部那个灰色宽按钮是不是「不在区域内」（= 地图页 + 定位漂移）。
+
+    【为什么需要·用户 2026-09-17 明确要求】
+    地图页在「定位漂到校外」时，底部按钮由绿变灰、文字变成「不在区域内」。
+    而 click_sign_button() 阶段A 的判据只看有没有蓝/绿/灰按钮 ——
+    一个灰色宽按钮会被当成「未到签到时段/已结束」，**直接判 not_time 并 return**。
+
+    后果有两层（都很严重）：
+      ① 明明只是定位漂移，却报成「今天没推送」——**误报正常状态**（违反铁律 R14）。
+         用户看台账会以为今天没推送；自愈不记故障；飞书也报「并非失败」。
+      ② 外层重试循环看到 not_time 就 break（日志原话「重试无意义」），
+         **连"重新跑一遍流程"的机会都没有**。
+         用户原话：「如果遇到不在区域内重新跑一遍流程，然后去签到」。
+
+    【判据】OCR 读该灰按钮文字，命中「不在区域内/未在区域/不在区域」即认定。
+    **读不到 / 引擎不可用 / 任何异常 -> 一律返回 False**（铁律 R7：读不到 != 坏的），
+    这样行为**完全退化为改动前**，绝不引入新的误判。
+    """
+    try:
+        if full is None or not btns:
+            return False
+        _grays = [b for b in btns if b.get("kind") == "gray"]
+        if not _grays:
+            return False
+        _b = max(_grays, key=lambda z: z.get("w", 0) * z.get("h", 0))
+        _t = (ocr_button_text(full, _b) or "").replace(" ", "")
+        if not _t:
+            return False
+        for _kw in ("不在区域内", "未在区域", "不在区域"):
+            if _kw in _t:
+                logger.warning(f"[详情页] 灰按钮文字读到「{_t[:20]}」-> 判定为地图页定位漂移")
+                return True
+        return False
+    except Exception as _e:
+        logger.warning(f"[详情页] 判断「不在区域内」失败（按'不是'处理，照旧走原逻辑）: "
+                       f"{type(_e).__name__}: {_e}")
+        return False
+
+# ===== 补丁 D1（2026-09-17）：读页面日期判断记录是不是今天的 =====
+def _detail_record_is_today(hwnd, full=None):
+    """读详情页的「签到时间」，判断这条记录是不是**今天**的。
+
+    【为什么需要·2026-09-17 实测】
+    原来那个守卫的前提是「不在签到时段内的灰色'已签到'记录必然不是今天的」。
+    **这个前提不成立** —— 实测 2026-09-17 21:57：
+    用户在 21:25 自己手动签了（重复签到场景），脚本 21:57 才跑，
+    页面上明明就是**今天**的「已签到」，却被判成 not_time。
+    后果：台账把「今天已签到」记成 not_time —— 统计失真、用户以为没签上。
+
+    **更直接的证据就在页面上**：详情页显示
+        「签到时间：2026-09-17 21:25」
+    —— 日期比「用时间窗反推」可靠得多（README 早已记下这条）。
+
+    【判据】OCR 整窗 -> 找「签到时间」之后的 8 位数字（YYYYMMDD）-> 与今天比较。
+    **读不到 / 引擎不可用 / 异常 -> 返回 False**（铁律 R7），行为退化为改动前。
+    """
+    try:
+        if full is None or hwnd is None:
+            return False
+        # ★ 必须只 OCR 小程序窗口那一块，不能整屏 OCR。
+        # 2026-09-18 用真实样本离线验证发现：整屏 OCR 会把任务栏 / 资源管理器
+        # 的文字一起读进来，导致「签到时间」那一行被读错
+        # （实测同一张样本读成 520260972125，多出一位 5，日期就取错了）。
+        # 裁出窗口后同一张样本读作 202609172125 ✅
+        _wl, _wt, _wr, _wb = win_rect(hwnd)
+        if _wl <= -30000 or _wt <= -30000:
+            return False
+        _HH, _WW = full.shape[:2]
+        _wl, _wt = max(0, _wl), max(0, _wt)
+        _wr, _wb = min(_WW, _wr), min(_HH, _wb)
+        if _wr - _wl < 100 or _wb - _wt < 100:
+            return False
+        _win = full[_wt:_wb, _wl:_wr]
+        _eng = _ocr_get_engine()
+        if _eng is None:
+            return False
+        _txt = (_ocr_read(_eng, _win) or "").replace(" ", "")
+        if "签到时间" not in _txt:
+            return False
+        _seg = _txt.split("签到时间", 1)[1]
+        _digits = "".join(ch for ch in _seg if ch.isdigit())
+        if len(_digits) < 8:
+            return False
+        _ymd = _digits[:8]
+        _today = datetime.now().strftime("%Y%m%d")
+        if _ymd == _today:
+            logger.info(f"[详情页] 页面「签到时间」读到 {_ymd} == 今天 -> 这条记录就是今天的")
+            return True
+        logger.info(f"[详情页] 页面「签到时间」读到 {_ymd} != 今天({_today}) -> 不是今天的记录")
+        return False
+    except Exception as _e:
+        logger.warning(f"[详情页] 读取页面日期失败（按'不是今天'处理，照旧走原逻辑）: "
+                       f"{type(_e).__name__}: {_e}")
+        return False
+
+
+
+
+
+
+
 def click_sign_button():
     """完整两页流程，返回 success/not_time/fail。
     详情页: 绿色'请假'+蓝色'签到'(并排) -> 点蓝色签到进入地图定位页；
@@ -3030,7 +3349,11 @@ def click_sign_button():
             # 因为第二轮重试可能在 21:30 之后才进来，此时若第一轮其实已签成功，页面会显示"已签到"——
             # 那是**真实成功**，不能当成历史记录否掉（否则会把成功漏报成 not_time）。
             # 阶段A 走到这里时 finish_clicks 恒为 0（还没点过"完成签到"），故用它作为"未提交"的判据。
-            if finish_clicks == 0 and not _within_signin_window():
+            # 【补丁 D2·2026-09-17】用页面上的日期做**更直接的判据**：
+            # 若「签到时间」就是今天，说明这条记录是今天的 -> 直接判成功，
+            # 不再因为"超出脚本时段"而误报 not_time。
+            _rec_today = _detail_record_is_today(h, (_cap_last[0] if _cap_last else None))
+            if finish_clicks == 0 and not _within_signin_window() and not _rec_today:
                 logger.warning(f"[详情页] 检测到灰色'已签到'，但当前不在签到时段"
                                f"[{SIGNIN_TIME_START}~{SIGNIN_TIME_END}]内，且本轮尚未提交过签到请求"
                                f"——该记录必然不是今天的，判 not_time（防止把昨天'已结束'记录误判成今天已签）")
@@ -3045,15 +3368,26 @@ def click_sign_button():
             shot("详情页_已是已签到")
             TRACE.end_step("short_circuit", "DETAIL_ALREADY_SIGNED")
             return "success"
-        if not green and gray:
+        # 【补丁 N2·2026-09-17】先分辨「地图页定位漂移」与「未到时段/已结束」——
+        # 两者都是灰色宽按钮，含义却完全不同：前者应重试/自愈，后者才该收工。
+        # 这里**只加条件、不动原函数体**，避免"旧代码残留在后面"（见 absent_signatures）。
+        _not_in_area = (not green and bool(gray)
+                        and _is_not_in_area(h, btns, full=(_cap_last[0] if _cap_last else None)))
+        if _not_in_area:
+            logger.warning("[详情页] 检测到灰色「不在区域内」—— 已在地图页但定位漂移，"
+                           "**不判 not_time**；转入定位自愈（重新定位 / 重连 WiFi），"
+                           "仍不行会返回失败并由外层完整重跑一遍流程")
+        if not green and gray and not _not_in_area:
             logger.warning("[详情页] 只有灰色宽按钮、无蓝/绿且非'已签到'形态——未到签到时段/已结束，不点击不关机")
             TRACE.end_step("skipped", "NOT_TIME")
             return "not_time"
-        if not green:
+        if not green and not _not_in_area:
             logger.error(f"[详情页] {DETAIL_WAIT}秒内未出现任何签到按钮，页面可能异常")
             TRACE.end_step("fail", "DETAIL_NO_BUTTON")
             return "fail"
-        logger.info("[详情页] 未见蓝色签到但有绿色按钮，判断已在地图定位页，直接进入阶段B")
+        logger.info("[详情页] 未见蓝色签到但已在地图页（"
+                    + ("灰色「不在区域内」-> 走定位自愈" if _not_in_area else "有绿色按钮")
+                    + "），直接进入阶段B")
     else:
         logger.info(f"[详情页] 点击蓝色'签到'({blue['cx']},{blue['cy']})，进入地图定位页")
         pyautogui.click(blue["cx"], blue["cy"]); time.sleep(3.2)

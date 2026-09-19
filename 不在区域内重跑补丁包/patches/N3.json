@@ -1,0 +1,17 @@
+{
+  "title": "放行「不在区域内」走到阶段B（而不是判 fail）",
+  "why": "定位漂移时 green 也是 False。若不改这一行，N2 放行后会立刻落到 `if not green:` 被判 fail —— 虽然比 not_time 诚实，但白白浪费了阶段B 本来就有的定位自愈（重新定位 + 重连 WiFi）。",
+  "risk": "低（`_not_in_area` 为 False 时该行逐字等价于原来的 `if not green:`）",
+  "op": "replace_lines",
+  "function": "click_sign_button",
+  "find": "if not green:",
+  "expected_delta_lines": 0,
+  "signatures": [
+    "if not green and not _not_in_area:"
+  ],
+  "absent_signatures": [
+    "if not green:\n"
+  ],
+  "new": "        if not green and not _not_in_area:",
+  "id": "N3"
+}
